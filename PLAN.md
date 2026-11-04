@@ -71,7 +71,7 @@ Kafka → Spark Structured Streaming → Redis → hybrid scoring → live Strea
 | Hop | Budget | Mechanism |
 |---|---|---|
 | Producer → broker | ≤ 50 ms | batched produce, `linger.ms=5` |
-| Broker → Spark micro-batch | ≤ 1.2 s | `trigger="1 second"`, `maxOffsetsPerTrigger=400` |
+| Broker → Spark micro-batch | ≤ 0.7 s | `trigger="500 milliseconds"`, `local[4]`, `maxOffsetsPerTrigger=400` |
 | Spark agg → Redis write | ≤ 200 ms | `foreachBatch` pipeline with batched `hset` |
 | Redis read (scorer) | ≤ 5 ms | single `HGETALL` per card |
 | Model inference | ≤ 10 ms | XGBoost CPU, single row |
@@ -79,6 +79,8 @@ Kafka → Spark Structured Streaming → Redis → hybrid scoring → live Strea
 | **Measured total (broker→alert published)** | **< 5 s p95** | `make bench` reports p50/p95/p99 per hop |
 
 Micro-batching dominates the budget: typical end-to-end ≈ 1.5–3 s. SHAP explanation is **async** and never blocks the alert publish.
+
+*(post-v0.1.0)* Measured steady state at ~173 tx/s: **p50 0.94 s, p95 1.32 s, p99 1.56 s** (was 2.54/4.17/6.85 at v0.1.0). Changes: trigger 1 s → 500 ms, Spark `local[2]` → `local[4]` (3 Kafka partitions fit one task wave instead of two), and the scorer polls Kafka in ≤ 100-message batches so a slow snapshot wait can't swallow the stream. A cold (re)start costs one slow bench while the Spark state store recovers from its checkpoint (p99 ≈ 4.4 s on the first run).
 
 ---
 
@@ -209,9 +211,11 @@ velocity:
 
 **M5 result (run `b94ee73d…`, registered v3 = champion):** AE alone val AUPRC 0.134 / test 0.064 (base rate ≈ 0.037), so it carries some signal but every blend is worse than XGBoost alone: sweep 0.466 (w=0.5) → 0.543 (0.8) → 0.549 (0.9) → **0.550 (w=1.0, selected)**. The AE lane stays packaged, calibrated and reported, and is skipped at serving while w=1. **Temporal test (one evaluation, never used for selection):** AUPRC **0.489**, ROC-AUC 0.884, recall@FPR 5 % 0.590, precision@50 1.0. Reference: XGBoost on all 431 raw columns gets 0.561 val / **0.510 test**, so the test period is harder for any model and ours reaches 96 % of that ceiling.
 
-**Packaging:** one MLflow pyfunc per version (booster + AE weights + preprocessing + calibration + w + feature order), loaded by the scorer via the alias. macOS note: torch and XGBoost ship separate libomp runtimes; `import_torch()` loads XGBoost first (else segfault) and pins torch to one thread (else deadlock).
+*(post-v0.1.0)* **The AE lane was measured once more and cut.** The last untested hypothesis — that the AE is a *behavioral* detector and wants velocity features only — was run against the v3 champion: the velocity-only lane scored **val AUPRC 0.064** (half the all-features lane, and the loss curve converges to near-zero: it just learns to reconstruct velocities), and every blend again selected w = 1.0. With both configurations measured and no case for the lane, the model is **XGBoost-only** from v5 on: `models/ensemble.py` packages booster + feature order, the scorer no longer loads torch, and `models/autoencoder.py` stays as the reference implementation (tested). Versions ≤ 4 carry the old AE-packaged pyfunc and need pre-0.1.1 code to load; v5 reproduces v3's metrics exactly (same seed/params — val 0.5503, test 0.4892), which is the point: only the package changed.
 
-**Threshold policy:** operating point = **max recall s.t. FPR ≤ 5 %** on val; report recall + alert precision@50 at that point. Risk bands: high ≥ `thr_high` (FPR ≤ 1 %), medium ≥ 5 %-thr, review 90th-percentile score. Thresholds are logged as val metrics on each training run, and the scorer reads them from the served version's run, so model and operating point move together.
+**Packaging:** one MLflow pyfunc per version — *(≤ v4: booster + AE weights + preprocessing + calibration + w + feature order; v5 on: booster + feature order)* — loaded by the scorer via the alias. macOS note: torch and XGBoost ship separate libomp runtimes; `import_torch()` loads XGBoost first (else segfault) and pins torch to one thread (else deadlock) — a serving-path concern until the AE cut removed torch from the scorer.
+
+**Threshold policy:** operating point = **max recall s.t. FPR ≤ 5 %** on val; report recall + alert precision@50 at that point. Risk bands: high ≥ `thr_high` (FPR ≤ 1 %), medium ≥ 5 %-thr (= the alert gate). *(post-v0.1.0)* The third band (review, 90th-percentile val score) was measured and dropped: that floor is the FPR ≈ 7.5 % operating point, and the region below medium held 2.6 % of all traffic at 8–9 % precision offline and 0 % on the 336-alert live sample. Every band is now an FPR-bounded validation operating point. Thresholds are logged as val metrics on each training run, and the scorer reads them from the served version's run, so model and operating point move together.
 
 **Explainability:** per-alert SHAP top-5 |impact| features via XGBoost's native TreeSHAP (`pred_contribs`, the TreeExplainer algorithm), on the XGBoost lane in log-odds, computed on a background worker after publish (~13 ms per alert batch) and attached to the API's alert record (`GET /alerts/{id}`, dashboard drill-down).
 
@@ -223,14 +227,20 @@ velocity:
 
 1. **Canary:** scorer loads both `champion` and `challenger` aliases; every event scored twice; alerts use champion only; per-event score delta + agreement logged to Prometheus (`streamguard_canary_delta`) and sampled to MLflow.
 2. **Drift:** §8 PSI job → Prometheus gauge + Grafana panel; PSI > 0.2 on any top-20-importance feature = retrain flag in README runbook.
-3. **Retraining trigger (manual, documented):** drift flag or canary degradation → rerun `make train` with same code, new window → registry promotion flow.
+3. **Retraining trigger:** drift flag or canary degradation → rerun `make train` with same code, new window → registry promotion flow. *(post-v0.1.0)* Automated as `make watch-drift` ([ops/watch.py](src/streamguard/ops/watch.py)): polls `/drift` every 30 s and, on **3 consecutive** flagged windows (a single flag is the calibrated monitor doing its job on a volatile feature), runs `make train` once — registering a fresh challenger, tagged `retrain_trigger=drift` + the flagged features, with a 1 h cooldown against retrain storms. **It never promotes**: the canary gate + `make promote` stay the human decision.
 4. **Grafana boards (provisioned):** consume lag (s), tx/s, alert rate, p50/p95/p99 latency, Redis hit-rate, PSI heatmap, canary delta.
+
+**Resilience drills *(post-v0.1.0):*** three kill-mid-stream drills at ~200 tx/s (12 k events each, measured with `scripts/measure_resilience.py`, `make resilience-mark` / `make resilience-measure SINCE=…`):
+- **Scorer `kill -9`:** the consumer group resumes from its last commit — **12 000/12 000 scored, 0 missing, 900 duplicates** (the ≤ 5 s auto-commit window), recovery ≈ 90 s incl. model reload. At-least-once, loss-free.
+- **Redis restart:** originally crashed *both* remaining components — the Spark `foreachBatch` Redis writer (no retry) and the scorer's consumer loop (a `ConnectionError` in the snapshot fetch killed the thread). Fixed: the Spark writer retries with exponential backoff (~63 s); the scorer re-polls the batch (snapshot fetch precedes any publish, so a failed batch is neither published nor committed). After the fix both survive a mid-stream Redis restart: 0 missing, ~700 events published in degraded mode (no velocity snapshot) while Redis was down.
+- **Spark kill:** checkpoint resume replays the gap and re-writes the missing snapshots — **0 duplicates, 0 missing**, self-healed.
+- Measurement note: `make replay` re-streams the dataset from row 0 (`REPLAY_OFFSET`), so id-based duplicate counts are only meaningful within one replay window — scope with `--since` and a fresh `resilience-mark`.
 
 **M6 implementation & results:**
 - `make train` registers each new version as **challenger** (the first ever becomes champion). The scorer scores every event with both aliases (`GET /canary`, `streamguard_canary_*`); `make promote` moves the alias only if p95 |Δ| < 0.02 over ≥ 1 k events, recording the canary stats + `previous_champion` as version tags; `make rollback` is one alias move. *(post-v0.1.0)* The scorer polls the aliases every 30 s, loads changed models off the hot path and installs them between batches (`streamguard_model_swaps_total`); measured 16 s for a promote and 26 s for a rollback, with no restart.
 - Canary run (12 k events, v3 champion vs v4 = seed-7 retrain with w = 0.95): p95 |Δ| **0.118**, mean Δ −0.034 (the 5 % AE lane shifts scores up), alert agreement 97.3 % → **promotion refused** by the gate (correct). Forced promote → rollback drill restored v3 in two commands.
 - Drift: 10 k-row train sample + **per-feature calibrated thresholds** logged per run (`drift_reference.npz`); the scorer recomputes PSI (NaN = its own bin) every 30 s over a full 20 k-event window; flag = any top-20-gain feature with PSI > its threshold. *Calibration (post-v0.1.0):* the original fixed 0.2 rule fired live on a window inside the training period. Measured on 38 training windows of 20 k events, it false-alarms on 18 % of them (V201/V257/V258/V218/V187/c10 swing to PSI ≈ 0.47 week to week). Threshold = max(0.2, worst within-training-window PSI) → 0/38 train, 0/8 val, 0/8 test windows flagged; injected `c1` ×2 and 30 % missing `addr2` detected in 8/8 test windows. *Present-values PSI + discrete binning (post-v0.1.0):* quantile edges collapsed for value-dominated features (93 % of V187 = 1.0 → one bin), so `psi` now uses one bin per value when a feature has ≤ 50 distinct values. A second statistic, `psi_finite` (present values only, renormalized, needs ≥ 200 of them), has its own calibrated threshold; ratio = max of both. Moving 20 % of V187's present values from 1 to 2 went from 0/8 to 8/8 test windows detected (10 %: 6/8); V201 likewise 0/8 → 8/8. False alarms after recalibration: 0/38 train, 0/8 val. Test: 2/8 windows flag on V218 (present-value mean ~1.4 → ~17, presence 15 % → 24 %, early-to-mid June), where AUPRC is 0.45 vs 0.51–0.54 in clean windows: likely real drift.
-- `make bench`: 12 k events continuing the stream @ 177 tx/s → end-to-end p50 **2.54 s**, p95 **4.17 s** (KPI < 5 s ✅), p99 6.85 s; Spark micro-batch + snapshot wait dominate, inference/publish ≈ 10 ms.
+- `make bench`: 12 k events continuing the stream @ 177 tx/s → end-to-end p50 **2.54 s**, p95 **4.17 s** (KPI < 5 s ✅), p99 6.85 s; Spark micro-batch + snapshot wait dominate, inference/publish ≈ 10 ms. *(post-v0.1.0: 0.94 / 1.32 / 1.56 s — see §3.)*
 
 ---
 
@@ -274,7 +284,7 @@ Heavy deps are **optional extras** (`[train]`, `[stream]`) so the default `uv sy
 | KPI | Target | Result (v0.1.0) | Measured by |
 |---|---|---|---|
 | AUPRC (temporal test) | ≥ 0.48 (≥ 95 % of all-columns ceiling 0.510) | **0.489** ✅ (96 %) · val 0.550 | `make train` → MLflow run `b94ee73d…` (v3) |
-| p95 end-to-end latency @ ~200 tx/s | < 5 s | **4.17 s** ✅ (p50 2.54, p99 6.85 @ 177 tx/s) | `make bench` → `artifacts/bench.json` |
+| p95 end-to-end latency @ ~200 tx/s | < 5 s | **1.32 s** ✅ steady state *(post-v0.1.0; was 4.17 s)* — p50 0.94, p99 1.56 @ 173 tx/s | `make bench` → `artifacts/bench.json` |
 | Online/offline feature parity | max Δ < 1e-6 | **0** ✅ (1 k cards × 13 features, 60 k events) | `make parity` |
 | Live vs offline score parity | (added M3) | **0** ✅ (5 k events) | M3 check |
 | Recall @ FPR 5 % | report | **0.590** test · 0.653 val | `make train` |
