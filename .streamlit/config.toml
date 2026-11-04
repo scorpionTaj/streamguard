@@ -1,0 +1,13 @@
+# StreamGuard dashboard theme — dark security-ops look (colors match app.py CSS).
+[theme]
+base = "dark"
+primaryColor = "#ff5c5c"
+backgroundColor = "#0b0e17"
+secondaryBackgroundColor = "#121829"
+textColor = "#e8ecf4"
+
+[client]
+toolbarMode = "minimal"
+
+[browser]
+gatherUsageStats = false

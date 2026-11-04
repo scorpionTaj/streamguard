@@ -1,25 +1,32 @@
 """StreamGuard live dashboard (PLAN.md §2) — `make dashboard`, expects `make api` on :8000.
 
-Header (every 2 s): scored, throughput, alerts, live precision, p95 latency, models.
-Tabs:  🚨 Live alerts  — filtered feed + drill-down (transaction, velocity, SHAP drivers)
-       🩺 Model health — champion/challenger canary, calibrated drift, precision by band
+Design: dark security-ops theme (.streamlit/config.toml + CSS below). Layout:
+    header (every 2 s)  — LIVE/IDLE pill + six KPI cards
+    🚨 Live alerts      — filtered feed (styled) + drill-down (verdict banner, velocity, SHAP chart)
+    🩺 Model health     — canary verdict, calibrated drift, precision by band
 Labels are replayed with the stream, so alert precision is measured live.
 Data shaping lives in views.py (unit-tested); this file is layout + polling only.
 """
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import httpx
 import pandas as pd
 import streamlit as st
 
 from views import (
-    BAND_ICON,
+    BAD_HEX,
+    BAND_HEX,
     BANDS,
     LABELS,
+    NEUTRAL_HEX,
+    OK_HEX,
     alerts_table,
     canary_verdict,
     drift_table,
+    drivers_frame,
     filter_alerts,
     precision_by_band,
     velocity_table,
@@ -30,7 +37,54 @@ PROMETHEUS = "http://localhost:9090"
 MAX_ALERTS = 1000
 
 st.set_page_config(page_title="StreamGuard", page_icon="🛡️", layout="wide")
-st.title("🛡️ StreamGuard — live fraud alerts")
+
+CSS = f"""
+<style>
+    #MainMenu, footer, header {{ visibility: hidden; }}
+    .block-container {{ padding-top: 1.1rem; padding-bottom: 1.4rem; max-width: 1600px; }}
+
+    /* brand line */
+    .sg-title {{ display: flex; align-items: baseline; gap: .6rem; margin-bottom: 0; }}
+    .sg-title h1 {{ font-size: 1.45rem; font-weight: 800; letter-spacing: -.01em; margin: 0; }}
+    .sg-sub {{ color: #8b94ab; font-size: .8rem; }}
+
+    /* status pills */
+    .sg-pill {{ display: inline-block; border-radius: 999px; padding: .1rem .7rem;
+                font-size: .74rem; font-weight: 700; letter-spacing: .06em;
+                border: 1px solid; vertical-align: middle; }}
+    .sg-live {{ color: {OK_HEX}; border-color: {OK_HEX}66; background: {OK_HEX}18; }}
+    .sg-idle {{ color: #8b94ab; border-color: #3a4460; background: #8b94ab14; }}
+
+    /* KPI cards */
+    [data-testid="stMetric"] {{ background: #121829; border: 1px solid #232c44;
+                               border-radius: 12px; padding: 13px 18px 9px; height: 100%; }}
+    [data-testid="stMetricLabel"] p {{ color: #8b94ab !important; font-size: .72rem;
+                                       letter-spacing: .05em; text-transform: uppercase; }}
+    [data-testid="stMetricValue"] {{ font-variant-numeric: tabular-nums; font-weight: 700;
+                                     font-size: 1.5rem; }}
+    .stColumns > div:nth-child(3) [data-testid="stMetric"],
+    .stColumns > div:nth-child(4) [data-testid="stMetric"] {{ border-left: 3px solid {BAD_HEX}; }}
+    .stColumns > div:nth-child(5) [data-testid="stMetric"] {{ border-left: 3px solid {OK_HEX}; }}
+    .stColumns > div:nth-child(1) [data-testid="stMetric"],
+    .stColumns > div:nth-child(2) [data-testid="stMetric"],
+    .stColumns > div:nth-child(6) [data-testid="stMetric"] {{ border-left: 3px solid {NEUTRAL_HEX}; }}
+
+    /* verdict / status banners */
+    .sg-banner {{ border: 1px solid #232c44; border-left: 3px solid {NEUTRAL_HEX};
+                  background: #121829; border-radius: 10px; padding: .65rem 1rem;
+                  font-size: .9rem; }}
+    .sg-banner b {{ letter-spacing: .02em; }}
+
+    /* sidebar */
+    [data-testid="stSidebar"] {{ background: #0d1120; border-right: 1px solid #232c44; }}
+    [data-testid="stSidebar"] h2 {{ font-size: .8rem; letter-spacing: .1em;
+                                    text-transform: uppercase; color: #8b94ab; }}
+
+    /* dataframe cell emphasis set via Styler */
+    #feed-table {{ border: 1px solid #232c44; border-radius: 10px; overflow: hidden; }}
+</style>
+"""
+st.markdown(CSS, unsafe_allow_html=True)
 
 if "alerts" not in st.session_state:
     st.session_state.alerts = {}  # transaction_id → alert dict
@@ -77,12 +131,20 @@ def current_alerts() -> list[dict]:
     )
 
 
+def pill(text: str, color: str) -> str:
+    return (f'<span class="sg-pill" style="color: {color}; border-color: {color}66; '
+            f'background: {color}18">{text}</span>')  # fmt: skip
+
+
+def banner(html: str, color: str) -> None:
+    st.markdown(f'<div class="sg-banner" style="border-left-color: {color}">{html}</div>',
+                unsafe_allow_html=True)  # fmt: skip
+
+
 @st.fragment(run_every=2)
 def header() -> None:
     poll_alerts()
     stats = get_json(f"{API_BASE}/stats")
-    if stats is None:
-        st.warning("Scorer API not reachable on :8000 — run `make api`.")
     by_band = (stats or {}).get("by_band", {})
     # 1-minute rate from Prometheus: the scorer works in bursts, a 2 s delta jumps 0 ↔ 200
     rate = prometheus_scalar("sum(rate(streamguard_scored_total[1m]))")
@@ -92,6 +154,23 @@ def header() -> None:
     alerts = list(st.session_state.alerts.values())
     labeled = [a for a in alerts if a["risk_band"] in ("high", "medium")]
     precision = sum(a["is_fraud"] for a in labeled) / len(labeled) if labeled else None
+
+    if alerts:
+        newest = max(a["scored_at"] for a in alerts)
+        age = (datetime.now(UTC) - datetime.fromisoformat(newest)).total_seconds()
+        status = pill("● LIVE", OK_HEX) if age < 10 else pill(f"IDLE {age / 60:.0f}m", "#8b94ab")
+    else:
+        status = pill("STARTING", "#8b94ab")
+    version = stats.get("model_version") if stats else None
+    chips = status
+    if version:
+        chips += f" &nbsp; {pill(f'champion v{version}', NEUTRAL_HEX)}"
+    st.markdown(
+        '<div class="sg-title"><h1>🛡️ StreamGuard</h1>'
+        '<span class="sg-sub">real-time fraud detection · Kafka → Spark → Redis → XGBoost</span>'
+        f'</div><div style="margin: .15rem 0 .8rem">{chips}</div>',
+        unsafe_allow_html=True,  # fmt: skip
+    )
 
     cols = [*st.columns(3), *st.columns(3)]  # two rows: readable on narrow screens
     cols[0].metric("Transactions scored", f"{stats['scored']:,}" if stats else "—")
@@ -103,9 +182,6 @@ def header() -> None:
                    help="Share of high+medium alerts on this page labeled fraud")  # fmt: skip
     cols[5].metric("p95 latency (1m)", f"{p95:.2f} s" if p95 is not None else "—",
                    help="Producer send → alert published, from Prometheus; KPI < 5 s")  # fmt: skip
-    if stats and stats.get("model_version"):
-        st.caption(f"Champion v{stats['model_version']} · "
-                   f"{stats.get('feature_misses', 0)} events scored without a velocity snapshot")  # fmt: skip
 
 
 @st.fragment(run_every=2)
@@ -126,6 +202,17 @@ def feed() -> None:
     )  # fmt: skip
 
 
+def verdict_banner(alert: dict) -> None:
+    band = alert["risk_band"]
+    color = BAND_HEX[band]
+    truth = f'<b style="color: {BAD_HEX}">FRAUD</b>' if alert["is_fraud"] else "legit"
+    banner(f'{pill(band.upper(), color)} &nbsp; score <b>{alert["score"]:.3f}</b> '
+           f'≥ floor {alert["threshold"]:.3f} &nbsp;·&nbsp; ground truth: {truth} '
+           f'&nbsp;·&nbsp; model v{alert["model_version"]}', color)  # fmt: skip
+    st.progress(min(1.0, alert["score"]), text=f"score {alert['score']:.3f} "
+                f"(band floor {alert['threshold']:.3f})")  # fmt: skip
+
+
 @st.fragment(run_every=2)
 def drill_down() -> None:
     st.subheader("Alert drill-down")
@@ -136,18 +223,16 @@ def drill_down() -> None:
     by_id = {a["transaction_id"]: a for a in rows}
     tx_id = st.selectbox(
         "Alert", list(by_id), key="selected_alert",
-        format_func=lambda i: f"{BAND_ICON[by_id[i]['risk_band']]} tx {i} · "
+        format_func=lambda i: f"{by_id[i]['risk_band'].upper()} · tx {i} · "
                               f"score {by_id[i]['score']:.3f} · ${by_id[i]['transaction_amt']:,.2f}",
     )  # fmt: skip
     # re-fetch: SHAP drivers are attached asynchronously after the alert first arrives
     alert = get_json(f"{API_BASE}/alerts/{tx_id}") or by_id[tx_id]
     st.session_state.alerts[tx_id] = alert
+    verdict_banner(alert)
     left, right = st.columns([2, 3])
     with left:
-        st.markdown(f"**{BAND_ICON[alert['risk_band']]} {alert['risk_band'].upper()}** — "
-                    f"score {alert['score']:.3f} ≥ band floor {alert['threshold']:.3f}")  # fmt: skip
-        st.markdown(f"Ground truth: **{'fraud' if alert['is_fraud'] else 'legit'}** · "
-                    f"model v{alert['model_version']}")  # fmt: skip
+        st.markdown("**Transaction**")
         details = {
             "card": alert["card_key"], "amount": f"${alert['transaction_amt']:,.2f}",
             "product": alert["product_cd"], "network / type": f"{alert['card4']} / {alert['card6']}",
@@ -167,18 +252,10 @@ def drill_down() -> None:
                        else f"Previous transaction {since / 60:,.1f} min earlier")  # fmt: skip
         else:
             st.caption("No velocity snapshot (scored on a feature miss).")
-        st.markdown("**Top drivers** (SHAP on the XGBoost lane, log-odds)")
+        st.markdown("**Top drivers** — SHAP log-odds impact (right = toward fraud)")
         drivers = alert.get("top_drivers") or []
         if drivers:
-            st.dataframe(
-                pd.DataFrame({
-                    "feature": [d["feature"] for d in drivers],
-                    "impact": [d["impact"] for d in drivers],
-                    "pushes toward": ["fraud ↑" if d["impact"] > 0 else "legit ↓" for d in drivers],
-                }),
-                hide_index=True, use_container_width=True,
-                column_config={"impact": st.column_config.NumberColumn(format="%+.3f")},
-            )  # fmt: skip
+            st.bar_chart(drivers_frame(drivers), horizontal=True, color=BAD_HEX, height=230)
         else:
             st.caption(
                 "Explanation pending — computed asynchronously after the alert is published."
@@ -203,7 +280,13 @@ def model_health() -> None:
                    help="Promotion gate: < 0.02 over ≥ 1,000 events")  # fmt: skip
     agreement = canary.get("alert_agreement")
     cols[3].metric("Alert agreement", f"{agreement:.1%}" if agreement is not None else "—")
-    st.markdown(canary_verdict(canary))
+    verdict = canary_verdict(canary)
+    if verdict["state"] == "pass":
+        banner(f"{pill('PROMOTABLE', OK_HEX)} &nbsp; {verdict['detail']}", OK_HEX)  # fmt: skip
+    elif verdict["state"] == "fail":
+        banner(f"{pill('PROMOTION BLOCKED', BAD_HEX)} &nbsp; {verdict['detail']}", BAD_HEX)
+    else:
+        banner(verdict["detail"], NEUTRAL_HEX)
     st.caption("Promote with `make promote`, revert with `make rollback`; "
                "the scorer swaps models within ~30 s, no restart needed.")  # fmt: skip
 
@@ -218,11 +301,14 @@ def model_health() -> None:
         else:
             flagged = drift.get("flagged", [])
             if flagged:
-                st.error(f"Retrain flag: top-20 feature(s) beyond their calibrated threshold — "
-                         f"{', '.join(flagged)}")  # fmt: skip
+                banner(f"{pill('RETRAIN FLAG', BAD_HEX)} top-20 feature(s) beyond their "
+                       f"calibrated threshold — <b>{', '.join(flagged)}</b>", BAD_HEX)  # fmt: skip
             else:
-                st.success(f"No drift flag over the last {rows:,} events "
-                           "(every top-20 feature within its training-calibrated range).")  # fmt: skip
+                banner(
+                    f"{pill('NOMINAL', OK_HEX)} no drift flag over the last {rows:,} events "
+                    "(every top-20 feature within its training-calibrated range).",
+                    OK_HEX,
+                )
             st.dataframe(
                 drift_table(drift), hide_index=True, use_container_width=True,
                 column_config={
@@ -245,13 +331,19 @@ def model_health() -> None:
 
 
 with st.sidebar:
-    st.header("Filters")
+    st.markdown("## Filters")
     st.multiselect("Risk bands", BANDS, default=BANDS, key="band_filter")
     st.radio("Ground truth", LABELS, horizontal=True, key="label_filter")
     st.slider("Minimum score", 0.0, 1.0, 0.0, 0.05, key="min_score")
     st.text_input("Card or transaction id", key="card_query", placeholder="e.g. 3e2947…")
     st.divider()
-    st.caption(f"Polling {API_BASE} every 2 s · Prometheus {PROMETHEUS}")
+    st.markdown("## System")
+    stats = get_json(f"{API_BASE}/stats")
+    st.caption(
+        f"Champion **v{stats['model_version']}** serving · API {API_BASE} · Prometheus {PROMETHEUS}"
+        if stats else f"Scorer API on {API_BASE} is down — run `make api`."
+    )  # fmt: skip
+    st.caption("Ops: `make promote` / `make rollback` / `make bench` / `make drift`")
 
 header()
 live_tab, health_tab = st.tabs(["🚨 Live alerts", "🩺 Model health"])
