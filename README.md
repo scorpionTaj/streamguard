@@ -34,6 +34,8 @@ All numbers come from the commands in the last column. The data is IEEE-CIS (590
 
 The first bench after a cold (re)start is slower while Spark recovers its state store from the checkpoint (p99 ≈ 4.4 s); the running service then holds the table above. *(post-v0.1.0)* Three changes cut end-to-end p99 from 6.85 s to 1.56 s: the micro-batch trigger 1 s → 500 ms, Spark `local[2]` → `local[4]` (3 Kafka partitions no longer run in two task waves), and the scorer polls Kafka in ≤ 100-message batches so it never swallows the stream while waiting for snapshots. The model itself is negligible (~10 ms).
 
+**Load run — 3.9× the design rate** *(post-v0.1.0)*: replayed at ~774 tx/s (the synthetic-clock pacing compresses to the 1 ms scheduler floor; the ceiling is Python's sleep granularity, not the pipeline). Steady state over two 12 k-event runs: **p50 2.13 s, p95 2.98 s, p99 3.20 s** — the same < 5 s p95 KPI holds at 3.9× the rate, with no dropped events. Two capacity knobs were raised for the load rate and are inert at 200 tx/s (`max_offsets_per_trigger` 400 → 2000, scorer poll cap 100 → 500); the producer now pre-serializes payloads off the pacing path, and the bench reads its true produce rate from Kafka CreateTime spans.
+
 ## Architecture
 
 ![architecture](docs/architecture.svg)

@@ -202,17 +202,33 @@ def run(
             log.error("delivery failed: %s", err)
 
     # Absolute schedule (not sleep-per-event) so per-event overhead doesn't erode the rate.
+    # Pydantic serialization stays off the pacing path: pre-serialized when the window is
+    # small enough to hold in memory (benches/drills), otherwise the legacy per-event path.
     next_send = time.perf_counter()
     prev_dt: float | None = None
-    for tx, dt in zip(iter_transactions(frame, v_subset), frame["TransactionDT"], strict=True):
-        if speed > 0 and prev_dt is not None:
-            next_send += pace_delay(dt - prev_dt, speed, max_rate)
-            if (wait := next_send - time.perf_counter()) > 0:
-                time.sleep(wait)
-        prev_dt = dt
-        producer.produce(topic, key=tx.card_key, value=tx.model_dump_json(),
-                         on_delivery=on_delivery)  # fmt: skip
+
+    def produce(key: str, payload: str) -> None:
+        producer.produce(topic, key=key, value=payload, on_delivery=on_delivery)
         producer.poll(0)
+
+    if frame.height <= 50_000:
+        events = [(tx.card_key, tx.model_dump_json(), dt) for tx, dt in
+                  zip(iter_transactions(frame, v_subset), frame["TransactionDT"], strict=True)]  # fmt: skip
+        for key, payload, dt in events:
+            if speed > 0 and prev_dt is not None:
+                next_send += pace_delay(dt - prev_dt, speed, max_rate)
+                if (wait := next_send - time.perf_counter()) > 0:
+                    time.sleep(wait)
+            prev_dt = dt
+            produce(key, payload)
+    else:
+        for tx, dt in zip(iter_transactions(frame, v_subset), frame["TransactionDT"], strict=True):
+            if speed > 0 and prev_dt is not None:
+                next_send += pace_delay(dt - prev_dt, speed, max_rate)
+                if (wait := next_send - time.perf_counter()) > 0:
+                    time.sleep(wait)
+            prev_dt = dt
+            produce(tx.card_key, tx.model_dump_json())
     producer.flush(30)
     log.info("delivered %d / %d events to %s (%d failed)", delivered, frame.height, topic, failed)
     if failed or delivered != frame.height:

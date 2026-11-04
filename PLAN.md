@@ -82,6 +82,8 @@ Micro-batching dominates the budget: typical end-to-end ≈ 1.5–3 s. SHAP expl
 
 *(post-v0.1.0)* Measured steady state at ~173 tx/s: **p50 0.94 s, p95 1.32 s, p99 1.56 s** (was 2.54/4.17/6.85 at v0.1.0). Changes: trigger 1 s → 500 ms, Spark `local[2]` → `local[4]` (3 Kafka partitions fit one task wave instead of two), and the scorer polls Kafka in ≤ 100-message batches so a slow snapshot wait can't swallow the stream. A cold (re)start costs one slow bench while the Spark state store recovers from its checkpoint (p99 ≈ 4.4 s on the first run).
 
+**Load run *(post-v0.1.0)***: at **~774 tx/s** (3.9× the design rate; the ceiling is the Python pacer's sleep granularity, not the pipeline) — **p50 2.13 s, p95 2.98 s, p99 3.20 s**, KPI still met, two 12 k-event runs. `max_offsets_per_trigger` 400 → 2000 and the scorer poll cap 100 → 500 were raised for the load rate (inert at 200 tx/s); the producer pre-serializes payloads off the pacing path and the bench derives its rate from Kafka CreateTime spans.
+
 ---
 
 ## 4. Data Contract (Kafka topics)

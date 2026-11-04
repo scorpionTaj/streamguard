@@ -15,7 +15,7 @@ kafka:
 
 features_job:
   trigger: 500 milliseconds  # micro-batch formation is most of the Spark hop (make bench)
-  max_offsets_per_trigger: 400
+  max_offsets_per_trigger: 2000  # > 1 s of stream at the 1,000 tx/s load rate; inert at ~200 tx/s
   watermark: 10 minutes
   checkpoint_dir: checkpoints/features
 

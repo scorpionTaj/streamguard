@@ -41,8 +41,10 @@ from streamguard.streaming.features_job import velocity_columns
 
 log = logging.getLogger("streamguard.scorer")
 
-CONSUME_MAX = 100  # small polls keep `consumed` near arrival: a large cap swallows the
-#                    stream while a batch waits for Spark snapshots — the latency tail
+CONSUME_MAX = 500  # small polls keep `consumed` near arrival: a huge cap swallows the
+#                    stream while a batch waits for Spark snapshots — the latency tail.
+#                    500 still bounds that at ~200 tx/s (≈100 arrive per 0.5 s poll)
+#                    and lets the scorer drain faster than the 1,000 tx/s load rate
 SCORED = Counter("streamguard_scored_total", "Transactions scored")
 ALERTS = Counter("streamguard_alerts_total", "Alerts published", ["band"])
 FEATURE_MISSES = Counter(

@@ -116,6 +116,7 @@ def main() -> None:
         speed=float(os.getenv("TIME_COMPRESSION", 8800)),
         max_rate=float(os.getenv("REPLAY_RATE_TX_PER_SEC", 200)))  # fmt: skip
     produce_s = time.time() - started
+    print(f"produced in {produce_s:.1f} s (incl. dataset load + serialization)")
 
     deadline, spans = time.time() + args.timeout, []
     while time.time() < deadline:
@@ -130,10 +131,13 @@ def main() -> None:
     stats = hop_stats(spans, list(body["fields"]))
     commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True,
                             text=True, cwd=REPO_ROOT).stdout.strip()  # fmt: skip
+    created = [s[1] for s in spans]  # Kafka CreateTime of the window events → true produce rate
+    produce_rate = (len(created) / (max(created) - min(created))
+                    if len(created) > 1 and max(created) > min(created) else 0.0)  # fmt: skip
     meta = {
         "timestamp": datetime.now(UTC).isoformat(timespec="seconds"),
         "events": len(spans),
-        "throughput_tx_s": len(ids) / produce_s,
+        "throughput_tx_s": round(produce_rate, 1),
         "model_version": health.get("model_version"),
         "git_commit": commit,
         "kpi_p95_s": KPI_P95_S,
