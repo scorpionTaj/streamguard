@@ -5,7 +5,13 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from streamguard.eval.drift import PSI_FLAG, DriftMonitor, reference_sample
+from streamguard.eval.drift import (
+    PSI_FLAG,
+    DriftMonitor,
+    DriftReference,
+    calibrate_thresholds,
+    reference_sample,
+)
 from streamguard.eval.latency import hop_stats
 from streamguard.serving.canary import MIN_EVENTS, TOLERANCE, CanaryWindow, summarize
 
@@ -30,24 +36,66 @@ class TestCanary:
         assert summarize(np.array([]), np.array([], bool))["events"] == 0
 
 
-class TestDriftMonitor:
-    def test_flags_only_important_shifted_features(self):
+def _seasonal_train(rng, n=40_000):
+    """Feature 0 calm; feature 1 alternates its mean between weekly-ish regimes."""
+    x = rng.normal(size=(n, 3))
+    x[:, 1] += np.where((np.arange(n) // 5_000) % 2 == 0, 0.0, 1.5)
+    return x
+
+
+class TestCalibration:
+    def test_bursty_feature_gets_higher_threshold_with_floor(self):
         rng = np.random.default_rng(0)
-        train = rng.normal(size=(20_000, 3))
-        monitor = DriftMonitor(reference_sample(train), ["a", "b", "c"], important=["a", "b"],
-                               min_rows=1000)  # fmt: skip
-        live = rng.normal(size=(3000, 3))
-        live[:, 1] += 2.0  # important feature drifts
-        live[:, 2] += 2.0  # unimportant feature drifts
+        train = _seasonal_train(rng)
+        thresholds = calibrate_thresholds(
+            reference_sample(train), train, window=5_000, stride=2_500
+        )
+        assert thresholds[0] == pytest.approx(PSI_FLAG)  # calm → floor
+        assert thresholds[1] > 2 * PSI_FLAG  # regime swings are normal for this feature
+
+    def test_window_must_fit(self):
+        rng = np.random.default_rng(0)
+        x = rng.normal(size=(100, 2))
+        assert calibrate_thresholds(x, x, window=1_000).tolist() == [PSI_FLAG, PSI_FLAG]
+
+
+def _monitor(train, important, window=5_000):
+    sample = reference_sample(train)
+    thresholds = calibrate_thresholds(sample, train, window=window, stride=window // 2)
+    ref = DriftReference(sample, ["a", "b", "c"], thresholds, window)
+    return DriftMonitor(ref, important)
+
+
+class TestDriftMonitor:
+    def test_in_distribution_regime_is_not_drift(self):
+        rng = np.random.default_rng(1)
+        train = _seasonal_train(rng)
+        monitor = _monitor(train, ["a", "b", "c"])
+        live = rng.normal(size=(5_000, 3))
+        live[:, 1] += 1.5  # a regime already seen during training
         monitor.add(live)
         report = monitor.compute()
-        assert report["flagged"] == ["b"] and report["drift_flag"]
-        assert report["features"]["c"] > PSI_FLAG and report["features"]["a"] < PSI_FLAG
+        assert report["features"]["b"] > PSI_FLAG  # the old fixed rule would have fired
+        assert not report["drift_flag"]
 
-    def test_waits_for_enough_rows(self):
-        monitor = DriftMonitor(np.zeros((100, 1)), ["a"], ["a"], min_rows=50)
-        monitor.add(np.zeros((10, 1)))
-        assert monitor.compute()["features"] == {}
+    def test_real_shift_on_important_feature_flags(self):
+        rng = np.random.default_rng(2)
+        train = _seasonal_train(rng)
+        monitor = _monitor(train, ["a", "b"])
+        live = rng.normal(size=(5_000, 3))
+        live[:, 0] += 1.0  # calm feature moves: drift
+        live[:, 2] += 3.0  # unimportant feature: reported, not flagged
+        monitor.add(live)
+        report = monitor.compute()
+        assert report["flagged"] == ["a"] and report["drift_flag"]
+        assert report["features"]["c"] / report["thresholds"]["c"] > 1.0
+
+    def test_waits_for_a_full_window(self):
+        rng = np.random.default_rng(3)
+        monitor = _monitor(_seasonal_train(rng), ["a"])
+        monitor.add(rng.normal(size=(4_999, 3)))
+        report = monitor.compute()
+        assert report["features"] == {} and report["rows"] == 4_999
 
 
 def test_hop_stats_from_spans():

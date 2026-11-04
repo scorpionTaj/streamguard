@@ -10,27 +10,27 @@
 
 All numbers come from the commands in the last column. The data is IEEE-CIS (590,540 real, labeled e-commerce transactions), evaluated on a strict temporal split with no shuffling.
 
-| KPI | Target | Result | Proof |
-|---|---|---|---|
-| **AUPRC, temporal test** | ≥ 0.48 (≥ 95 % of the all-columns ceiling) | **0.489** ✅ (val 0.550) | `make train` → MLflow |
-| p95 end-to-end latency @ ~200 tx/s | < 5 s | **4.17 s** ✅ (p50 2.54 s, p99 6.85 s) | `make bench` → `artifacts/bench.json` |
-| Online/offline feature parity | max \|Δ\| < 1e-6 | **0** ✅ (1 k cards × 13 features, 60 k events) | `make parity` |
-| Live vs offline score parity | — | **0** ✅ (5 k events) | M3 check |
-| Recall @ FPR 5 % · precision@50 | report | 0.590 · 1.00 (test) | `make train` |
-| Canary gate | promote only if p95 \|Δscore\| < 0.02 | challenger at 0.118 → **refused** ✅ | `make promote` |
-| Drift | PSI < 0.2 on top-20 features | mechanics ✅, threshold needs calibration (see limitations) | `make drift`, Grafana |
+| KPI                                | Target                                       | Result                                                      | Proof                                      |
+| ---------------------------------- | -------------------------------------------- | ----------------------------------------------------------- | ------------------------------------------ |
+| **AUPRC, temporal test**     | ≥ 0.48 (≥ 95 % of the all-columns ceiling) | **0.489** ✅ (val 0.550)                              | `make train` → MLflow                   |
+| p95 end-to-end latency @ ~200 tx/s | < 5 s                                        | **4.17 s** ✅ (p50 2.54 s, p99 6.85 s)                | `make bench` → `artifacts/bench.json` |
+| Online/offline feature parity      | max \|Δ\| < 1e-6                            | **0** ✅ (1 k cards × 13 features, 60 k events)      | `make parity`                            |
+| Live vs offline score parity       | —                                           | **0** ✅ (5 k events)                                 | M3 check                                   |
+| Recall @ FPR 5 % · precision@50   | report                                       | 0.590 · 1.00 (test)                                        | `make train`                             |
+| Canary gate                        | promote only if p95 \|Δscore\| < 0.02       | challenger at 0.118 → **refused** ✅                 | `make promote`                           |
+| Drift monitor (calibrated PSI)     | no false alarms in-distribution; catches real shifts | **0/54** train/val/test windows flagged ✅ (fixed 0.2 rule: 18 % of train windows); injected count inflation and missing-data outage caught 8/8 | `make drift`, Grafana                    |
 
 **About the AUPRC target.** Published XGBoost PR-AUC figures (0.78–0.88) come from other card-fraud datasets. On IEEE-CIS with a temporal split, XGBoost using **all 431 raw columns** reaches only 0.561 on validation and **0.510 on test**, because the last 17 % of the timeline is harder for any model. StreamGuard's 111 streaming-safe features reach 96 % of that test ceiling. The target was re-anchored to the measured ceiling, and every step is recorded in [PLAN.md §8](./PLAN.md#8-evaluation-protocol).
 
 **Latency per hop** (`make bench`, 12 k events @ 177 tx/s):
 
-| hop | p50 (s) | p95 (s) | p99 (s) |
-|---|---|---|---|
-| broker → Spark → Redis | 1.41 | 2.90 | 5.55 |
-| snapshot wait (scorer) | 1.44 | 1.98 | 2.52 |
-| inference (features + model) | 0.01 | 0.01 | 0.01 |
-| publish | 0.01 | 0.01 | 0.01 |
-| **end-to-end** | **2.54** | **4.17** | **6.85** |
+| hop                          | p50 (s)        | p95 (s)        | p99 (s)        |
+| ---------------------------- | -------------- | -------------- | -------------- |
+| broker → Spark → Redis     | 1.41           | 2.90           | 5.55           |
+| snapshot wait (scorer)       | 1.44           | 1.98           | 2.52           |
+| inference (features + model) | 0.01           | 0.01           | 0.01           |
+| publish                      | 0.01           | 0.01           | 0.01           |
+| **end-to-end**         | **2.54** | **4.17** | **6.85** |
 
 Spark's 1-second micro-batch accounts for most of the latency, while the model itself is negligible.
 
@@ -42,7 +42,7 @@ Spark's 1-second micro-batch accounts for most of the latency, while the model i
 2. **Spark Structured Streaming:** keeps exact trailing-window velocity (5 m / 1 h / 24 h / 7 d counts, sums and means, plus time since the previous transaction) per card with `applyInPandasWithState`. It writes the latest snapshot per card (`sg:card:*`) and a per-event snapshot (`sg:tx:*`) to Redis.
 3. **FastAPI scorer:** consumes the same topic and **waits for each event's own snapshot**. It builds the feature vector with the *offline* twin's code, scores with the MLflow `champion` (and the `challenger`, as a canary), and publishes scored transactions and banded alerts. SHAP top-5 drivers are attached asynchronously.
 4. **Streamlit dashboard:** live feed, counters, live alert precision (labels are replayed with the stream), and a per-alert drill-down showing the velocity snapshot and SHAP drivers.
-5. **Prometheus + Grafana:** throughput, alerts by band, latency p50/p95/p99, consumer lag, snapshot hit-rate, PSI per feature, retrain flag, canary delta.
+5. **Prometheus + Grafana:** throughput, alerts by band, latency p50/p95/p99, consumer lag, snapshot hit-rate, PSI ÷ calibrated threshold per feature, retrain flag, canary delta.
 
 ## Design decisions worth a look
 
@@ -98,7 +98,8 @@ Checks and operations: `make parity`, `make bench`, `make drift`, `make promote`
 
 ## Limitations & next steps
 
-- **The PSI threshold needs calibrating.** With time compression, the 10–20 k-event live window covers about one simulated week, and a single week naturally sits around PSI 0.2 against months of training data. In the demo the flag fired on a window that lies *inside* the training period, and cyclical day-of-week features always read as drifted. Next step: set the threshold from the distribution of window-to-window PSI within the training data, or use event-time windows.
+- **Drift thresholds are calibrated per feature, which costs some sensitivity.** A fixed PSI > 0.2 rule false-alarmed on 18 % of 20 k-event windows *inside* the training period, and it fired live during the demo. Several top features (V201, V257, V187, c10, …) routinely swing to PSI ≈ 0.47 from one week to the next. Each feature's threshold is now the worst PSI any training window of the live window's size shows (with 0.2 as a floor). In-distribution windows no longer flag, but a slow shift on those volatile features has to exceed their normal range before it fires.
+- **PSI can't see value shifts in mostly-missing features.** V187 is 84 % missing, so shifting its non-missing values by 1, 2 or 4 std leaves PSI at 0.068, under either rule. Missing-share changes *are* caught (missing is its own bin). Next step: a second PSI over the non-missing values alone.
 - **The autoencoder lane adds nothing yet.** Its own val AUPRC is 0.134 (base rate 0.037), and every blend scores below XGBoost alone, so the sweep picks `w = 1.0`. It stays packaged and reported as the "unknown unknowns" lane.
 - **Tail latency:** p99 is 6.85 s, driven by the micro-batch timing. Spark's real-time trigger or a smaller trigger interval would shorten it.
 - **Serving a new champion** requires restarting `make api`, since aliases are read at startup.
@@ -107,4 +108,4 @@ Checks and operations: `make parity`, `make bench`, `make drift`, `make promote`
 
 ## Repository
 
-The spec, contracts, milestone log and KPI table are in [PLAN.md](./PLAN.md) (§14 covers the layout). Most of the logic lives in `src/streamguard/`, and `tests/` holds 75 tests covering contracts, feature semantics, micro-batch-split invariance, scoring, the canary and drift.
+The spec, contracts, milestone log and KPI table are in [PLAN.md](./PLAN.md) (§14 covers the layout). Most of the logic lives in `src/streamguard/`, and `tests/` holds 78 tests covering contracts, feature semantics, micro-batch-split invariance, scoring, the canary and drift.

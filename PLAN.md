@@ -191,7 +191,7 @@ velocity:
 - **Benchmark anchor (re-anchored at M1):** the published 0.78–0.88 XGBoost PR-AUC band ([EAI 2024](https://publications.eai.eu/index.php/ismla/article/view/12078), [Masethe et al. 2026](https://www.preprints.org/manuscript/202608.1727)) comes from *other* card-fraud datasets and does not transfer to IEEE-CIS under a strict temporal split. Measured on our split, same XGBoost params: **all 431 raw columns → val AUPRC 0.562** (the practical ceiling); original 90-feature contract → 0.496; + D1–D15 and raw card/addr IDs → 0.547. **Re-anchored again at M7 on the test split:** the same all-columns reference only reaches **test AUPRC 0.510** (the last 17 % of the timeline is harder for any model), so the M1 target ≥ 0.55 — derived from validation — is unreachable on test. Final KPI: **test AUPRC ≥ 0.48, i.e. ≥ 95 % of the all-columns test ceiling** (stretch: match it, 0.51).
 - **Parity test** (`src/streamguard/eval/parity.py`): read every event on `transactions.raw`, recompute velocity offline, compare with the Redis hash of 1 k sampled cards (each hash = snapshot after the card's latest event); per-feature `max|Δ| < 1e-6`, else exit 1. Needs a single replay since `make reset`. M2 result: 60 k events at max rate, 152 micro-batches, max |Δ| = 0.
 - **Latency bench** (`src/streamguard/eval/latency.py`): instrumented producer→alert run (`make bench`), spans per hop written to `artifacts/bench.json`, rendered into README table.
-- **Drift** (`src/streamguard/eval/drift.py`): hourly PSI per feature vs training reference (10 bins, ε-smoothed); PSI > 0.2 → Grafana panel red + MLflow tag. Training-set reference histogram stored as a model artifact.
+- **Drift** (`src/streamguard/eval/drift.py`): PSI per feature vs training reference (10 quantile bins + a missing-value bin, ε-smoothed) over the last 20 k events; threshold calibrated per feature from same-size training windows (floor 0.2) → Grafana panel red + MLflow tag (see §10). Training-set reference histogram stored as a model artifact.
 
 ---
 
@@ -229,7 +229,7 @@ velocity:
 **M6 implementation & results:**
 - `make train` registers each new version as **challenger** (the first ever becomes champion). The scorer scores every event with both aliases (`GET /canary`, `streamguard_canary_*`); `make promote` moves the alias only if p95 |Δ| < 0.02 over ≥ 1 k events, recording the canary stats + `previous_champion` as version tags; `make rollback` is one alias move. Restart `make api` to serve a new champion.
 - Canary run (12 k events, v3 champion vs v4 = seed-7 retrain with w = 0.95): p95 |Δ| **0.118**, mean Δ −0.034 (the 5 % AE lane shifts scores up), alert agreement 97.3 % → **promotion refused** by the gate (correct). Forced promote → rollback drill restored v3 in two commands.
-- Drift: 10 k-row train sample logged per run (`drift_reference.npz`); scorer recomputes PSI (NaN = own bin) every 30 s over the last 20 k events; flag = any top-20-gain feature > 0.2. Live: top-20 max PSI 0.135 (`c10`) → no flag. Caveat seen live: `dow_*` PSI ≫ 0.2 in short windows (a 12 k-event window spans ≈ 1 simulated week, so weekday mix can't match training) — not a top-20 feature; real slow drift visible on `d10` (0.34).
+- Drift: 10 k-row train sample + **per-feature calibrated thresholds** logged per run (`drift_reference.npz`); the scorer recomputes PSI (NaN = its own bin) every 30 s over a full 20 k-event window; flag = any top-20-gain feature with PSI > its threshold. *Calibration (post-v0.1.0):* the original fixed 0.2 rule fired live on a window inside the training period. Measured on 38 training windows of 20 k events, it false-alarms on 18 % of them (V201/V257/V258/V218/V187/c10 swing to PSI ≈ 0.47 week to week). Threshold = max(0.2, worst within-training-window PSI) → 0/38 train, 0/8 val, 0/8 test windows flagged; injected `c1` ×2 and 30 % missing `addr2` detected in 8/8 test windows. Blind spot: PSI over a mostly-missing feature (V187, 84 % NaN) stays at 0.068 for any shift of its non-missing values.
 - `make bench`: 12 k events continuing the stream @ 177 tx/s → end-to-end p50 **2.54 s**, p95 **4.17 s** (KPI < 5 s ✅), p99 6.85 s; Spark micro-batch + snapshot wait dominate, inference/publish ≈ 10 ms.
 
 ---
@@ -279,7 +279,7 @@ Heavy deps are **optional extras** (`[train]`, `[stream]`) so the default `uv sy
 | Live vs offline score parity | (added M3) | **0** ✅ (5 k events) | M3 check |
 | Recall @ FPR 5 % | report | **0.590** test · 0.653 val | `make train` |
 | Alert precision@50 | report | **1.0** test · 1.0 val | `make train` |
-| Drift (PSI, top-20 feature) | < 0.2 steady-state | **0.135** max ✅ (no retrain flag) | `make drift`, Grafana |
+| Drift (calibrated PSI, top-20 features) | no in-distribution false alarms; catches real shifts | **0/54** train/val/test windows flagged (fixed 0.2: 18 % of train windows); injected shifts caught 8/8 ✅ | `make drift`, Grafana |
 | Canary agreement | score-delta p95 < 0.02 to promote | v4 challenger: **0.118** → promotion refused (gate works) | `GET /canary`, Grafana |
 
 ---

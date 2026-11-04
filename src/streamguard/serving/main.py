@@ -44,8 +44,7 @@ async def lifespan(_: FastAPI):
     reference = load_reference(model.run_id)
     drift = None
     if reference is not None:
-        sample, names = reference
-        drift = DriftMonitor(sample, names, top_features(model.model.booster))
+        drift = DriftMonitor(reference, top_features(model.model.booster))
     else:
         log.warning("champion v%s has no drift reference — PSI monitoring off", model.version)
     scorer = Scorer(
@@ -122,7 +121,7 @@ def drift() -> dict:
     """Latest PSI per feature vs the champion's training reference (eval/drift.py)."""
     if state.drift is None:
         return {"rows": 0, "features": {}, "detail": "no drift reference for this champion"}
-    return state.drift.latest if state.drift.latest["features"] else state.drift.compute()
+    return state.drift.compute()
 
 
 @app.get("/latency")
