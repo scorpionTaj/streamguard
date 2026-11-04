@@ -10,7 +10,8 @@ Contract (PLAN.md §9):
 - Ensemble: score = w·xgb + (1−w)·ae_percentile, w swept on val.
 - Log to MLflow: params, metrics, PR curve, features.yaml hash, data hash.
 
-The test split is reserved for the single final evaluation (M5) — not scored here.
+Selection (early stopping, AE calibration, w, band thresholds) uses val only;
+the temporal test split is evaluated once per run and only reported.
 """
 
 from __future__ import annotations
@@ -75,67 +76,126 @@ def evaluate(y_true: np.ndarray, y_score: np.ndarray) -> dict[str, float]:
     }
 
 
-def _pr_curve_png(y_true: np.ndarray, y_score: np.ndarray, auprc: float, path: Path) -> None:
+def _pr_curves_png(y_true: np.ndarray, curves: dict[str, np.ndarray], title: str,
+                   path: Path) -> None:  # fmt: skip
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from sklearn.metrics import precision_recall_curve
+    from sklearn.metrics import average_precision_score, precision_recall_curve
 
-    precision, recall, _ = precision_recall_curve(y_true, y_score)
     fig, ax = plt.subplots(figsize=(5, 4))
-    ax.plot(recall, precision, label=f"XGBoost (AUPRC {auprc:.3f})")
+    for label, score in curves.items():
+        precision, recall, _ = precision_recall_curve(y_true, score)
+        ax.plot(
+            recall, precision, label=f"{label} (AUPRC {average_precision_score(y_true, score):.3f})"
+        )
     ax.axhline(y_true.mean(), ls="--", c="grey", label=f"base rate {y_true.mean():.3f}")
-    ax.set(xlabel="recall", ylabel="precision", title="PR curve — validation split")
+    ax.set(xlabel="recall", ylabel="precision", title=title)
     ax.legend()
     fig.tight_layout()
     fig.savefig(path, dpi=120)
     plt.close(fig)
 
 
-def train_xgboost(limit: int = 0) -> dict[str, float]:
+def train_hybrid(limit: int = 0, ae_epochs: int = 100) -> dict[str, float]:
+    """XGBoost + autoencoder → w sweep → thresholds (all on val) → one test evaluation.
+
+    Every choice (early stopping, AE calibration, w, band thresholds) uses the
+    validation split only; test metrics are reported, never used to decide.
+    """
     import mlflow
     import xgboost as xgb
+
+    from streamguard.models.autoencoder import (
+        Preprocessor,
+        calibrated_percentile,
+        reconstruction_error,
+        train_autoencoder,
+    )
+    from streamguard.models.ensemble import HybridModel, pyfunc_model, sweep_weight
 
     features = build_training_frame(limit)
     columns = feature_columns(features)
     splits = temporal_split(features)
-    train, val = splits["train"], splits["val"]
-    x_train, y_train = train.select(columns).to_numpy(), train["is_fraud"].to_numpy()
-    x_val, y_val = val.select(columns).to_numpy(), val["is_fraud"].to_numpy()
-    log.info("train=%d val=%d features=%d", len(y_train), len(y_val), len(columns))
-
-    params = XGB_PARAMS | {"scale_pos_weight": float((y_train == 0).sum() / y_train.sum())}
-    dtrain = xgb.DMatrix(x_train, y_train, feature_names=columns)
-    dval = xgb.DMatrix(x_val, y_val, feature_names=columns)
+    x = {name: part.select(columns).to_numpy() for name, part in splits.items()}
+    y = {name: part["is_fraud"].to_numpy() for name, part in splits.items()}
+    log.info("train=%d val=%d test=%d features=%d",
+             len(y["train"]), len(y["val"]), len(y["test"]), len(columns))  # fmt: skip
 
     mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI", "http://127.0.0.1:5000"))
     mlflow.set_experiment(EXPERIMENT)
-    with mlflow.start_run(run_name="xgboost-baseline") as run:
+    with mlflow.start_run(run_name="hybrid-xgb-ae") as run:
+        # ── XGBoost lane ──────────────────────────────────────────────────────
+        params = XGB_PARAMS | {
+            "scale_pos_weight": float((y["train"] == 0).sum() / y["train"].sum())
+        }
+        dtrain = xgb.DMatrix(x["train"], y["train"], feature_names=columns)
+        dval = xgb.DMatrix(x["val"], y["val"], feature_names=columns)
         booster = xgb.train(
             params, dtrain, MAX_ROUNDS, evals=[(dval, "val")],
             early_stopping_rounds=EARLY_STOPPING, verbose_eval=100,
         )  # fmt: skip
-        p_val = booster.predict(dval, iteration_range=(0, booster.best_iteration + 1))
-        metrics = {f"val_{k}": v for k, v in evaluate(y_val, p_val).items()}
+        booster = booster[: booster.best_iteration + 1]  # serve the early-stopped model
 
-        mlflow.log_params(params | {"max_rounds": MAX_ROUNDS, "early_stopping": EARLY_STOPPING,
-                                    "best_iteration": booster.best_iteration,
-                                    "n_features": len(columns), "n_train": len(y_train),
-                                    "n_val": len(y_val), "limit": limit})  # fmt: skip
+        # ── Autoencoder lane (non-fraud train only, calibrated on val-normal) ─
+        normal = x["train"][y["train"] == 0]
+        pre = Preprocessor.fit(normal)
+        net, losses = train_autoencoder(pre.transform(normal), epochs=ae_epochs)
+        val_errors = reconstruction_error(net, pre.transform(x["val"]))
+        reference = np.sort(val_errors[y["val"] == 0])
+
+        def lanes(split: str) -> tuple[np.ndarray, np.ndarray]:
+            xgb_prob = np.asarray(booster.inplace_predict(x[split].astype(np.float32)), float)
+            errors = (
+                val_errors if split == "val" else reconstruction_error(net, pre.transform(x[split]))
+            )
+            return xgb_prob, calibrated_percentile(errors, reference)
+
+        # ── Ensemble weight + thresholds on val; one final test evaluation ───
+        xgb_val, ae_val = lanes("val")
+        weight, sweep = sweep_weight(y["val"], xgb_val, ae_val)
+        model = HybridModel(booster, net, pre, reference, weight, columns)
+        metrics: dict[str, float] = {}
+        for split in ("val", "test"):
+            xgb_prob, ae_pct = (xgb_val, ae_val) if split == "val" else lanes(split)
+            score = model.components(x[split])["score"]
+            metrics |= {f"{split}_{k}": v for k, v in evaluate(y[split], score).items()}
+            metrics |= {f"{split}_xgb_{k}": v for k, v in evaluate(y[split], xgb_prob).items()
+                        if k in ("auprc", "roc_auc", "recall_at_fpr_5pct")}  # fmt: skip
+            metrics |= {f"{split}_ae_{k}": v for k, v in evaluate(y[split], ae_pct).items()
+                        if k in ("auprc", "roc_auc", "recall_at_fpr_5pct")}  # fmt: skip
+            if split == "test":
+                curves = {"hybrid": score, "xgboost": xgb_prob, "autoencoder": ae_pct}
+        metrics |= {f"sweep_auprc_w{w:g}": v for w, v in sweep.items()}
+        metrics["ensemble_weight"] = weight
+
+        mlflow.log_params(params | {
+            "max_rounds": MAX_ROUNDS, "early_stopping": EARLY_STOPPING,
+            "best_iteration": booster.num_boosted_rounds() - 1, "ae_epochs": ae_epochs,
+            "ae_hidden": "64-32-8-32-64", "n_features": len(columns), "limit": limit,
+            "n_train": len(y["train"]), "n_val": len(y["val"]), "n_test": len(y["test"]),
+        })  # fmt: skip
         mlflow.log_metrics(metrics)
+        for epoch, loss in enumerate(losses):
+            mlflow.log_metric("ae_train_loss", loss, step=epoch)
         mlflow.set_tags({
-            "model_type": "xgboost",
+            "model_type": "hybrid-xgboost-autoencoder",
             "features_yaml_sha256": sha256_file(FEATURES_YAML),
             "data_sha256": sha256_file(TRANSACTION_CSV),
         })  # fmt: skip
         with tempfile.TemporaryDirectory() as tmp:
-            curve = Path(tmp) / "pr_curve_val.png"
-            _pr_curve_png(y_val, p_val, metrics["val_auprc"], curve)
+            _pr_curves_png(y["test"], curves, "PR curves — temporal test split",
+                           Path(tmp) / "pr_curve_test.png")  # fmt: skip
             (Path(tmp) / "feature_columns.json").write_text(json.dumps(columns))
             mlflow.log_artifacts(tmp)
-        mlflow.log_artifact(str(FEATURES_YAML))
-        info = mlflow.xgboost.log_model(booster, name="model", registered_model_name=MODEL_NAME)
+            model.save(Path(tmp) / "hybrid")
+            mlflow.log_artifact(str(FEATURES_YAML))
+            info = mlflow.pyfunc.log_model(
+                name="model", python_model=pyfunc_model(),
+                artifacts={"hybrid": str(Path(tmp) / "hybrid")},
+                registered_model_name=MODEL_NAME,
+            )  # fmt: skip
         log.info("run %s: %s", run.info.run_id, json.dumps(metrics, indent=2))
     ensure_champion(info.registered_model_version)
     return metrics
@@ -146,11 +206,12 @@ def main() -> None:
     from dotenv import load_dotenv
 
     load_dotenv()
-    parser = argparse.ArgumentParser(description="Train XGBoost baseline → MLflow")
+    parser = argparse.ArgumentParser(description="Train hybrid XGBoost + autoencoder → MLflow")
     parser.add_argument("--limit", type=int, default=0, help="rows to use (0 = all; smoke runs)")
+    parser.add_argument("--ae-epochs", type=int, default=100)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
-    train_xgboost(args.limit)
+    train_hybrid(args.limit, args.ae_epochs)
 
 
 if __name__ == "__main__":

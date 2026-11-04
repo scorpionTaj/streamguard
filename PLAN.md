@@ -3,7 +3,7 @@
 **Real-time fraud detection with an online feature store**
 Kafka → Spark Structured Streaming → Redis → hybrid scoring → live Streamlit alerts.
 
-> Status: 🚧 **in progress** — M0–M4 done (baseline val AUPRC 0.550; feature + score parity max |Δ| = 0; live dashboard, p95 ≈ 3.8 s @ ~175 tx/s); next: M5.
+> Status: 🚧 **in progress** — M0–M5 done (val AUPRC 0.550 / test 0.489 vs all-columns test ceiling 0.510; parity max |Δ| = 0; live dashboard + SHAP, p95 ≈ 3.8 s @ ~175 tx/s); next: M6.
 > Companion doc: [README.md](./README.md) (concept). This document is the single source of truth for scope, contracts, KPIs and milestones.
 
 ---
@@ -207,9 +207,13 @@ velocity:
 
 **Ensemble:** `score = w · xgb_prob + (1-w) · ae_percentile`, `w` swept {0.5…1.0} on val for max AUPRC (expect w≈0.8–0.9; AE is the "unknown unknowns" lane, reported separately too).
 
+**M5 result (run `b94ee73d…`, registered v3 = champion):** AE alone val AUPRC 0.134 / test 0.064 (base rate ≈ 0.037), so it carries some signal but every blend is worse than XGBoost alone: sweep 0.466 (w=0.5) → 0.543 (0.8) → 0.549 (0.9) → **0.550 (w=1.0, selected)**. The AE lane stays packaged, calibrated and reported, and is skipped at serving while w=1. **Temporal test (one evaluation, never used for selection):** AUPRC **0.489**, ROC-AUC 0.884, recall@FPR 5 % 0.590, precision@50 1.0. Reference: XGBoost on all 431 raw columns gets 0.561 val / **0.510 test**, so the test period is harder for any model and ours reaches 96 % of that ceiling.
+
+**Packaging:** one MLflow pyfunc per version (booster + AE weights + preprocessing + calibration + w + feature order), loaded by the scorer via the alias. macOS note: torch and XGBoost ship separate libomp runtimes; `import_torch()` loads XGBoost first (else segfault) and pins torch to one thread (else deadlock).
+
 **Threshold policy:** operating point = **max recall s.t. FPR ≤ 5 %** on val; report recall + alert precision@50 at that point. Risk bands: high ≥ `thr_high` (FPR ≤ 1 %), medium ≥ 5 %-thr, review 90th-percentile score. Thresholds are logged as val metrics on each training run, and the scorer reads them from the served version's run, so model and operating point move together.
 
-**Explainability:** per-alert SHAP (TreeExplainer, top-5 |impact| features), computed async, attached to the Alert record.
+**Explainability:** per-alert SHAP top-5 |impact| features via XGBoost's native TreeSHAP (`pred_contribs`, the TreeExplainer algorithm), on the XGBoost lane in log-odds, computed on a background worker after publish (~13 ms per alert batch) and attached to the API's alert record (`GET /alerts/{id}`, dashboard drill-down).
 
 **Registry discipline:** every train run → MLflow (params, metrics, PR curve, feature spec hash, data hash). Promotion = move alias `champion` → challenger after M6 canary shows score-delta distribution within tolerance. Rollback = alias revert (one command, `src/streamguard/models/registry.py`).
 

@@ -6,8 +6,10 @@ One background thread, consumer group `scorer` on `transactions.raw`:
            (written by the Spark job) — exact training-time features; on
            timeout the velocity columns are NaN and a miss is counted
         2. static features from the event via the offline twin (same code as training)
-        3. champion XGBoost score (batched inplace_predict)
+        3. champion hybrid score (XGBoost + autoencoder, batched)
         4. publish ScoredTx → transactions.scored; band-passing → Alert → transactions.alerts
+        5. SHAP top-5 for the batch's alerts on a background worker (never blocks publish);
+           drivers land on the API's alert records (GET /alerts/{transaction_id})
 Offsets are stored only after publishing (at-least-once). Prometheus metrics are
 module-level and exported by main.py /metrics.
 """
@@ -19,12 +21,14 @@ import threading
 import time
 from collections import Counter as TallyCounter
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 import numpy as np
 from prometheus_client import Counter, Histogram
 
+from streamguard.models.explainer import top_drivers
 from streamguard.models.registry import ServingModel, Thresholds
 from streamguard.offline.features import build_features, transactions_frame
 from streamguard.schemas import Alert, RiskBand, ScoredTx, Transaction
@@ -41,6 +45,8 @@ FEATURE_WAIT = Histogram("streamguard_feature_wait_seconds", "Wait for Spark sna
                          buckets=(0.005, 0.05, 0.25, 0.5, 1, 2, 3, 5, 10))  # fmt: skip
 INFERENCE = Histogram("streamguard_inference_seconds", "Feature build + model, per batch",
                       buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 1))  # fmt: skip
+EXPLAIN = Histogram("streamguard_explain_seconds", "Async SHAP per alert batch",
+                    buckets=(0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1))  # fmt: skip
 E2E = Histogram("streamguard_e2e_latency_seconds", "Producer send → scored/alert published",
                 buckets=(0.25, 0.5, 1, 1.5, 2, 3, 4, 5, 7.5, 10, 20))  # fmt: skip
 
@@ -90,14 +96,14 @@ def fetch_snapshots(redis_client, prefix: str, ids: list[int], names: list[str],
 
 
 def score_events(txs: list[Transaction], snapshots: dict[int, dict[str, float]],
-                 model: ServingModel, spec: dict) -> np.ndarray:  # fmt: skip
-    """Training-identical feature vectors (offline twin + Redis velocity) → champion scores."""
+                 model: ServingModel, spec: dict) -> tuple[np.ndarray, np.ndarray]:  # fmt: skip
+    """Training-identical feature vectors (offline twin + Redis velocity) → (scores, matrix)."""
     names = velocity_columns(spec)
     velocity = {n: np.array([snapshots.get(t.transaction_id, {}).get(n, np.nan) for t in txs])
                 for n in names}  # fmt: skip
     frame = transactions_frame(txs, spec.get("v_subset") or [])
     matrix = build_features(frame, spec, velocity).select(model.feature_names).to_numpy()
-    return np.asarray(model.booster.inplace_predict(matrix.astype(np.float32)), dtype=float)
+    return np.asarray(model.model.score(matrix), dtype=float), matrix
 
 
 class Scorer:
@@ -117,6 +123,7 @@ class Scorer:
             "enable.auto.offset.store": False,
         })  # fmt: skip
         self.producer = Producer({"bootstrap.servers": bootstrap, "linger.ms": 5})
+        self.explainer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="shap")
         self.consumer.subscribe([pipeline["topics"]["raw"]])
         state.model_version = model.version
 
@@ -132,6 +139,7 @@ class Scorer:
             self.state.error = repr(exc)
             raise
         finally:
+            self.explainer.shutdown(wait=False, cancel_futures=True)
             self.producer.flush(10)
             self.consumer.close()
 
@@ -143,13 +151,13 @@ class Scorer:
                                     self.wait_s)  # fmt: skip
         FEATURE_WAIT.observe(time.monotonic() - started)
         with INFERENCE.time():
-            scores = score_events(txs, snapshots, self.model, self.spec)
+            scores, matrix = score_events(txs, snapshots, self.model, self.spec)
 
         topics, version = self.pipeline["topics"], self.model.version
         thresholds = self.model.thresholds
         floors = {"high": thresholds.high, "medium": thresholds.medium, "review": thresholds.review}
-        new_alerts, misses = [], 0
-        for msg, tx, score in zip(messages, txs, scores, strict=True):
+        new_alerts, alert_rows, misses = [], [], 0
+        for row, (msg, tx, score) in enumerate(zip(messages, txs, scores, strict=True)):
             scored = ScoredTx(**tx.model_dump(), score=float(score), model_version=version,
                               scored_at=datetime.now(UTC))  # fmt: skip
             self.producer.produce(topics["scored"], key=tx.card_key, value=scored.model_dump_json())
@@ -161,6 +169,7 @@ class Scorer:
                 self.producer.produce(topics["alerts"], key=tx.card_key,
                                       value=alert.model_dump_json())  # fmt: skip
                 new_alerts.append(alert)
+                alert_rows.append(row)
                 ALERTS.labels(band).inc()
             self.consumer.store_offsets(msg)
             E2E.observe(max(0.0, time.time() - msg.timestamp()[1] / 1000.0))
@@ -173,3 +182,16 @@ class Scorer:
             self.state.feature_misses += misses
             self.state.alerts.extend(new_alerts)
             self.state.by_band.update(a.risk_band for a in new_alerts)
+        if new_alerts:  # SHAP off the publish path (PLAN.md §3)
+            self.explainer.submit(self.explain, new_alerts, matrix[alert_rows])
+
+    def explain(self, alerts: list[Alert], rows: np.ndarray) -> None:
+        try:
+            with EXPLAIN.time():
+                drivers = top_drivers(self.model.model.booster, rows, self.model.feature_names)
+        except Exception:
+            log.exception("SHAP explanation failed")
+            return
+        with self.state.lock:
+            for alert, top in zip(alerts, drivers, strict=True):
+                alert.top_drivers = top

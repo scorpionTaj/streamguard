@@ -1,18 +1,29 @@
-"""Per-alert SHAP explanations — milestone M5 (PLAN.md §9).
+"""Per-alert explanations (PLAN.md §9): top-5 signed SHAP contributions.
 
-Contract: given the champion XGBoost model and one feature vector, return the
-top-5 |SHAP| contributions as list[schemas.TopDriver] (signed values). Runs
-ASYNC in the scorer — never on the alert publish critical path.
+Uses XGBoost's native TreeSHAP (`pred_contribs=True`, the algorithm behind
+shap.TreeExplainer) on the XGBoost lane, in log-odds units. The autoencoder lane
+is reported as its own percentile, not decomposed. Runs ASYNC in the scorer —
+never on the alert publish path.
 """
 
 from __future__ import annotations
 
+import numpy as np
 
-def top_drivers(model, feature_vector, feature_names: list[str], k: int = 5) -> list:
-    """Return top-k signed SHAP contributions for one transaction. — M5"""
-    raise NotImplementedError("M5: shap.TreeExplainer → TopDriver list")
+from streamguard.schemas import TopDriver
 
 
-async def attach_drivers_async(alert) -> None:
-    """Fill `alert.top_drivers` off the publish path. — M5"""
-    raise NotImplementedError("M5: async SHAP task")
+def top_drivers(booster, matrix: np.ndarray, feature_names: list[str],
+                k: int = 5) -> list[list[TopDriver]]:  # fmt: skip
+    """For each row: the k features with the largest |SHAP| (bias term excluded)."""
+    import xgboost as xgb
+
+    if len(matrix) == 0:
+        return []
+    dmatrix = xgb.DMatrix(np.asarray(matrix, dtype=np.float32), feature_names=feature_names)
+    contribs = booster.predict(dmatrix, pred_contribs=True)[:, :-1]  # last column = bias
+    result = []
+    for row in contribs:
+        top = np.argsort(-np.abs(row), kind="stable")[:k]
+        result.append([TopDriver(feature=feature_names[i], impact=float(row[i])) for i in top])
+    return result

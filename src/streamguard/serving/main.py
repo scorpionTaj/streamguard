@@ -4,6 +4,7 @@ The lifespan loads the MLflow `champion` alias and starts the consumer loop
 (serving/consumer.py) in a background thread.
     GET /health        liveness + model version + consumer status
     GET /alerts        alerts newer than ?since=<ISO datetime> (Streamlit polls every 2 s)
+    GET /alerts/{id}   one alert incl. async SHAP top drivers
     GET /stats         counters: tx scored, alerts by band, feature misses
     GET /metrics       Prometheus exposition
 Canary (M6): serving/canary.py scores with the challenger too.
@@ -18,7 +19,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Query, Response
+from fastapi import FastAPI, HTTPException, Query, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from streamguard.config import load_feature_spec, load_pipeline_config
@@ -67,6 +68,18 @@ def alerts(since: datetime | None = None, limit: int = Query(200, ge=1, le=2000)
     with state.lock:
         recent = [a for a in state.alerts if since is None or a.scored_at > since]
     return {"alerts": [a.model_dump(mode="json") for a in recent[-limit:]]}
+
+
+@app.get("/alerts/{transaction_id}")
+def alert(transaction_id: int) -> dict:
+    """One alert, including SHAP top drivers once the async explainer has filled them."""
+    with state.lock:
+        found = next(
+            (a for a in reversed(state.alerts) if a.transaction_id == transaction_id), None
+        )
+        if found is None:
+            raise HTTPException(status_code=404, detail="alert not in the recent window")
+        return found.model_dump(mode="json")
 
 
 @app.get("/stats")

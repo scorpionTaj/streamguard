@@ -42,7 +42,7 @@ class Thresholds:
 
 @dataclass(frozen=True)
 class ServingModel:
-    booster: object  # xgboost.Booster
+    model: object  # models.ensemble.HybridModel (anything with .score(matrix) / .booster)
     version: str
     feature_names: list[str]
     thresholds: Thresholds
@@ -70,14 +70,14 @@ def ensure_champion(version: str | int) -> None:
 
 
 def load_alias(alias: str = CHAMPION) -> ServingModel:
-    """Load the aliased XGBoost booster plus its run's thresholds."""
-    import mlflow.xgboost
+    """Load the aliased hybrid model (pyfunc) plus its run's thresholds."""
+    import mlflow.pyfunc
 
     client = _client()
     version = client.get_model_version_by_alias(MODEL_NAME, alias)
-    booster = mlflow.xgboost.load_model(f"models:/{MODEL_NAME}@{alias}")
+    hybrid = mlflow.pyfunc.load_model(f"models:/{MODEL_NAME}@{alias}").unwrap_python_model().model
     metrics = client.get_run(version.run_id).data.metrics
-    return ServingModel(booster, str(version.version), list(booster.feature_names),
+    return ServingModel(hybrid, str(version.version), list(hybrid.feature_names),
                         Thresholds.from_run_metrics(metrics))  # fmt: skip
 
 

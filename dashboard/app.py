@@ -2,7 +2,7 @@
 
 Layout: header metrics (scored, tx/s, alerts, live precision, p95 latency)
 → alert feed (incremental poll of /alerts every 2 s, band filter)
-→ drill-down for one alert (transaction, velocity snapshot by window, SHAP drivers from M5).
+→ drill-down for one alert (transaction, velocity snapshot by window, SHAP top drivers).
 Labels are replayed with the stream, so alert precision is measured live.
 """
 
@@ -150,7 +150,9 @@ def drill_down() -> None:
         format_func=lambda i: f"{BAND_ICON[by_id[i]['risk_band']]} tx {i} · "
                               f"score {by_id[i]['score']:.3f} · ${by_id[i]['transaction_amt']:,.2f}",
     )  # fmt: skip
-    alert = by_id[tx_id]
+    # re-fetch: SHAP drivers are attached asynchronously after the alert first arrives
+    alert = get_json(f"{API_BASE}/alerts/{tx_id}") or by_id[tx_id]
+    st.session_state.alerts[tx_id] = alert
     left, right = st.columns([2, 3])
     with left:
         st.markdown(f"**{BAND_ICON[alert['risk_band']]} {alert['risk_band'].upper()}** — "
@@ -176,12 +178,22 @@ def drill_down() -> None:
                        else f"Previous transaction {since / 60:,.1f} min earlier")  # fmt: skip
         else:
             st.caption("No velocity snapshot (scored on a feature miss).")
-        st.markdown("**Top drivers (SHAP)**")
+        st.markdown("**Top drivers** (SHAP on the XGBoost lane, log-odds)")
         drivers = alert.get("top_drivers") or []
         if drivers:
-            st.dataframe(pd.DataFrame(drivers), hide_index=True, use_container_width=True)
+            st.dataframe(
+                pd.DataFrame({
+                    "feature": [d["feature"] for d in drivers],
+                    "impact": [d["impact"] for d in drivers],
+                    "pushes toward": ["fraud ↑" if d["impact"] > 0 else "legit ↓" for d in drivers],
+                }),
+                hide_index=True, use_container_width=True,
+                column_config={"impact": st.column_config.NumberColumn(format="%+.3f")},
+            )  # fmt: skip
         else:
-            st.caption("Explanations are attached asynchronously (milestone M5).")
+            st.caption(
+                "Explanation pending — computed asynchronously after the alert is published."
+            )
 
 
 with st.sidebar:

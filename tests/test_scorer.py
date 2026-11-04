@@ -27,10 +27,10 @@ class TestRiskBand:
         assert risk_band(score, THRESHOLDS) == band
 
 
-class _CaptureBooster:
-    """Stands in for xgboost.Booster: records the matrix, scores by row index."""
+class _CaptureModel:
+    """Stands in for HybridModel: records the matrix, scores by row index."""
 
-    def inplace_predict(self, matrix):
+    def score(self, matrix):
         self.matrix = matrix
         return np.linspace(0, 1, len(matrix))
 
@@ -62,21 +62,22 @@ class TestScoreEvents:
         columns = feature_columns(offline)
         snapshots = {t.transaction_id: {n: offline[n][i] for n in velocity_columns(SPEC)}
                      for i, t in enumerate(txs)}  # fmt: skip
-        booster = _CaptureBooster()
-        model = ServingModel(booster, "1", columns, THRESHOLDS)
+        hybrid = _CaptureModel()
+        model = ServingModel(hybrid, "1", columns, THRESHOLDS)
 
-        scores = score_events(txs, snapshots, model, SPEC)
+        scores, matrix = score_events(txs, snapshots, model, SPEC)
 
-        expected = offline.select(columns).to_numpy().astype(np.float32)
-        np.testing.assert_array_equal(booster.matrix, expected)
+        expected = offline.select(columns).to_numpy()
+        np.testing.assert_array_equal(hybrid.matrix, expected)
+        np.testing.assert_array_equal(matrix, expected)
         assert scores.tolist() == [0.0, 0.5, 1.0]
 
     def test_missing_snapshot_gives_nan_velocity_only(self):
         txs = _txs()[:1]
         columns = feature_columns(build_features(transactions_frame(txs, SPEC["v_subset"]), SPEC))
-        booster = _CaptureBooster()
-        score_events(txs, {}, ServingModel(booster, "1", columns, THRESHOLDS), SPEC)
-        row = dict(zip(columns, booster.matrix[0], strict=True))
+        hybrid = _CaptureModel()
+        score_events(txs, {}, ServingModel(hybrid, "1", columns, THRESHOLDS), SPEC)
+        row = dict(zip(columns, hybrid.matrix[0], strict=True))
         assert all(np.isnan(row[n]) for n in velocity_columns(SPEC))
         assert row["transaction_amt"] == 10.0
 
