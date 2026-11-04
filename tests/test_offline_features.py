@@ -15,9 +15,9 @@ from streamguard.offline.features import (
     select_v_subset,
     temporal_split,
     transactions_frame,
-    velocity_features,
 )
 from streamguard.schemas import Transaction
+from streamguard.velocity import velocity_features
 
 WINDOWS = {"5m": 300, "1h": 3600}
 METRICS = ["txn_count", "amt_sum", "amt_mean", "time_since_last_txn"]

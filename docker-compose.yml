@@ -57,17 +57,23 @@ services:
       retries: 10
 
   spark-features:
-    image: apache/spark:4.0.0
-    # fallback if the 4.0 image misbehaves on arm64:
-    # image: apache/spark:3.5.6
+    # apache/spark:4.0.0 + python deps (fallback base if 4.0 misbehaves on arm64: apache/spark:3.5.6)
+    build:
+      context: .
+      dockerfile: docker/spark.Dockerfile
+    image: streamguard-spark:4.0.0
     container_name: sg-spark
     profiles: ["streaming"]
     command:
       - /opt/spark/bin/spark-submit
       - --master
       - local[2]
+      - --packages
+      - org.apache.spark:spark-sql-kafka-0-10_2.13:4.0.0
       - --conf
-      - spark.executor.memory=1g
+      - spark.jars.ivy=/opt/ivy
+      - --conf
+      - spark.driver.memory=1g
       - --conf
       - spark.sql.shuffle.partitions=4
       - /opt/app/src/streamguard/streaming/features_job.py
@@ -75,11 +81,14 @@ services:
       KAFKA_BOOTSTRAP: redpanda:29092
       REDIS_URL: redis://redis:6379/0
       FEATURES_CONFIG: /opt/app/configs/features.yaml
+      PIPELINE_CONFIG: /opt/app/configs/pipeline.yaml
       CHECKPOINT_DIR: /opt/app/checkpoints/features
     mem_limit: 2g
+    user: root   # named volumes mount root-owned; the job only writes checkpoints/ivy there
     volumes:
       - ./:/opt/app
       - spark-checkpoints:/opt/app/checkpoints
+      - spark-ivy:/opt/ivy
     depends_on:
       redpanda:
         condition: service_healthy
@@ -117,3 +126,4 @@ volumes:
   prometheus-data:
   grafana-data:
   spark-checkpoints:
+  spark-ivy:

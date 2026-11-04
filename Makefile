@@ -1,4 +1,4 @@
-.PHONY: setup data up down logs replay features train parity bench drift api dashboard mlflow test lint format demo clean
+.PHONY: setup data up down logs replay features reset train parity bench drift api dashboard mlflow test lint format demo clean
 
 # ── Setup ────────────────────────────────────────────────────────────────────
 setup:            ## create venv + install all dependency groups
@@ -27,7 +27,13 @@ replay:           ## replay dataset into transactions.raw (limit with REPLAY_LIM
 	uv run python -m streamguard.producer.replay
 
 features:         ## run the Spark Structured Streaming feature job (in container)
-	docker compose up spark-features
+	docker compose up --build spark-features
+
+reset:            ## fresh stream: drop topics, Redis card hashes and Spark state (keeps infra up)
+	-docker compose rm -sf spark-features
+	-docker volume rm streamguard_spark-checkpoints
+	-docker exec sg-redpanda rpk topic delete transactions.raw transactions.scored transactions.alerts
+	docker exec sg-redis sh -c "redis-cli --scan --pattern 'sg:card:*' | xargs -r redis-cli del" >/dev/null
 
 train:            ## train XGBoost + AE, log to MLflow, evaluate on temporal test
 	uv run python -m streamguard.models.train

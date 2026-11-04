@@ -22,6 +22,7 @@ import polars as pl
 
 from streamguard.config import load_feature_spec, velocity_window_seconds
 from streamguard.schemas import Transaction
+from streamguard.velocity import velocity_features
 
 # Known mailbox providers in IEEE-CIS email domains; everything else → "other".
 _EMAIL_GROUPS: tuple[str, ...] = (
@@ -91,55 +92,6 @@ def load_transactions(limit: int = 0, v_subset: list[str] | None = None) -> pl.D
         v_subset = load_feature_spec().get("v_subset") or []
     raw = load_replay_frame(v_subset, limit)
     return transactions_frame(iter_transactions(raw, v_subset), v_subset)
-
-
-# ── Velocity (per-card trailing windows) ─────────────────────────────────────
-
-
-def velocity_features(
-    card_key: np.ndarray,
-    event_ts_s: np.ndarray,
-    amount: np.ndarray,
-    windows: dict[str, int],
-    metrics: list[str],
-    sentinel: float,
-) -> dict[str, np.ndarray]:
-    """Trailing-window aggregates per card, inputs in replay order (non-decreasing time).
-
-    Sums run on integer thousandths (amounts carry ≤ 3 decimals) so the result is
-    exact and independent of summation order — a prerequisite for 1e-6 parity.
-    """
-    n = card_key.size
-    _, codes = np.unique(card_key, return_inverse=True)
-    order = np.lexsort((np.arange(n), codes))  # by card, then replay order
-    ts = event_ts_s[order] - event_ts_s.min()
-    mills = np.round(amount[order] * 1000).astype(np.int64)
-    gap = float(ts.max()) + max(windows.values(), default=0) + 1.0
-    # Composite sort key: separates cards by more than any window → one searchsorted.
-    key = codes[order] * gap + ts
-    idx = np.arange(n)
-    cum = np.concatenate([[0], np.cumsum(mills)])
-
-    out: dict[str, np.ndarray] = {}
-    for name, seconds in windows.items():
-        start = np.searchsorted(key, key - seconds, side="right")
-        count = (idx - start + 1).astype(float)
-        total = (cum[idx + 1] - cum[start]) / 1000.0
-        computed = {"txn_count": count, "amt_sum": total, "amt_mean": total / count}
-        for metric in metrics:
-            if metric in computed:
-                out[f"{metric}_{name}"] = computed[metric]
-    if "time_since_last_txn" in metrics:
-        same_card = np.concatenate([[False], codes[order][1:] == codes[order][:-1]])
-        since = np.where(same_card, np.diff(ts, prepend=0.0), sentinel)
-        out["time_since_last_txn"] = since
-    unknown = set(metrics) - {"txn_count", "amt_sum", "amt_mean", "time_since_last_txn"}
-    if unknown:
-        raise ValueError(f"unknown velocity metrics in features.yaml: {sorted(unknown)}")
-
-    inverse = np.empty(n, dtype=np.int64)
-    inverse[order] = idx  # back to replay order
-    return {name: values[inverse] for name, values in out.items()}
 
 
 # ── Static features (name in features.yaml → expressions) ────────────────────

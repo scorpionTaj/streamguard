@@ -3,7 +3,7 @@
 **Real-time fraud detection with an online feature store**
 Kafka → Spark Structured Streaming → Redis → hybrid scoring → live Streamlit alerts.
 
-> Status: 🚧 **in progress** — M0–M1 done (baseline val AUPRC 0.550); next: M2.
+> Status: 🚧 **in progress** — M0–M2 done (baseline val AUPRC 0.550; online/offline parity max |Δ| = 0); next: M3.
 > Companion doc: [README.md](./README.md) (concept). This document is the single source of truth for scope, contracts, KPIs and milestones.
 
 ---
@@ -168,7 +168,9 @@ velocity:
     # uniq_merchants dropped at M1: IEEE-CIS has no merchant field
 ```
 
-~85 features total after one-hot. Null policy: `v`/`dist`/`device` nulls → XGBoost native NaN handling; AE input uses train-median imputation + missing-mask channel.
+111 features total after one-hot (M1).
+
+**Velocity semantics (M2, shared kernel `src/streamguard/velocity.py`):** for event *i* of card *k* at event time *t*, window *W* covers card *k*'s events *j ≤ i* (replay order = `(event_ts, transaction_id)`) with *t_j > t − W* — the snapshot **after** processing event *i*. Sums are exact (integer thousandths). The Spark job runs the same numpy kernel inside `applyInPandasWithState` (state = card events within 7d + last event, no timeout), and writes the card's latest snapshot to Redis `sg:card:<card_key>` = `{transaction_id, event_ts_s, <velocity features>}`. Static features are derived from the event itself by the scorer, not stored. Null policy: `v`/`dist`/`device` nulls → XGBoost native NaN handling; AE input uses train-median imputation + missing-mask channel.
 
 ---
 
@@ -185,7 +187,7 @@ velocity:
 
 - **Metrics** (`src/streamguard/eval/metrics.py`): AUPRC (primary), ROC-AUC (secondary), recall @ FPR 1 % / 5 %, alert precision@50, PR curve artifact logged to MLflow on every run.
 - **Benchmark anchor (re-anchored at M1):** the published 0.78–0.88 XGBoost PR-AUC band ([EAI 2024](https://publications.eai.eu/index.php/ismla/article/view/12078), [Masethe et al. 2026](https://www.preprints.org/manuscript/202608.1727)) comes from *other* card-fraud datasets and does not transfer to IEEE-CIS under a strict temporal split. Measured on our split, same XGBoost params: **all 431 raw columns → val AUPRC 0.562** (the practical ceiling); original 90-feature contract → 0.496; + D1–D15 and raw card/addr IDs → 0.547. KPI: **≥ 0.55**, stretch 0.60.
-- **Parity test** (`src/streamguard/eval/parity.py`): replay 1 k sampled events through the offline polars twin vs Spark/Redis online path; per-feature `max|Δ| < 1e-6`, else CI fails. This is the online/offline consistency proof.
+- **Parity test** (`src/streamguard/eval/parity.py`): read every event on `transactions.raw`, recompute velocity offline, compare with the Redis hash of 1 k sampled cards (each hash = snapshot after the card's latest event); per-feature `max|Δ| < 1e-6`, else exit 1. Needs a single replay since `make reset`. M2 result: 60 k events at max rate, 152 micro-batches, max |Δ| = 0.
 - **Latency bench** (`src/streamguard/eval/latency.py`): instrumented producer→alert run (`make bench`), spans per hop written to `artifacts/bench.json`, rendered into README table.
 - **Drift** (`src/streamguard/eval/drift.py`): hourly PSI per feature vs training reference (10 bins, ε-smoothed); PSI > 0.2 → Grafana panel red + MLflow tag. Training-set reference histogram stored as a model artifact.
 
