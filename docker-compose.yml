@@ -1,0 +1,119 @@
+# StreamGuard local infrastructure — one laptop, ~4 GB RAM.
+# The scorer (FastAPI), dashboard (Streamlit) and MLflow run on the host via `make`.
+services:
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.3.1
+    # Kafka-API compatible alternative with the same env/ports:
+    # image: apache/kafka:3.9.0
+    container_name: sg-redpanda
+    command:
+      - redpanda
+      - start
+      - --mode
+      - dev-container
+      - --smp
+      - "1"
+      - --memory
+      - 1G
+      - --overprovisioned
+      - --kafka-addr
+      - PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr
+      # docker-internal listeners (spark) and host listener (producer/scorer)
+      - PLAINTEXT://redpanda:9092,OUTSIDE://localhost:9092
+    ports:
+      - "9092:9092"
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redpanda-console:
+    image: docker.redpanda.com/redpandadata/console:v2.7.2
+    container_name: sg-console
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+    ports:
+      - "8085:8080"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+
+  redis:
+    image: redis:7.4-alpine
+    container_name: sg-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  spark-features:
+    image: apache/spark:4.0.0
+    # fallback if the 4.0 image misbehaves on arm64:
+    # image: apache/spark:3.5.6
+    container_name: sg-spark
+    profiles: ["streaming"]
+    command:
+      - /opt/spark/bin/spark-submit
+      - --master
+      - local[2]
+      - --conf
+      - spark.executor.memory=1g
+      - --conf
+      - spark.sql.shuffle.partitions=4
+      - /opt/app/src/streamguard/streaming/features_job.py
+    environment:
+      KAFKA_BOOTSTRAP: redpanda:9092
+      REDIS_URL: redis://redis:6379/0
+      FEATURES_CONFIG: /opt/app/configs/features.yaml
+      CHECKPOINT_DIR: /opt/app/checkpoints/features
+    mem_limit: 2g
+    volumes:
+      - ./:/opt/app
+      - spark-checkpoints:/opt/app/checkpoints
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: sg-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./configs/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # scrape the host-run scorer on :8000
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: sg-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./configs/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+
+volumes:
+  redpanda-data:
+  redis-data:
+  prometheus-data:
+  grafana-data:
+  spark-checkpoints:

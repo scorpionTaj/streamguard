@@ -1,0 +1,30 @@
+# Streaming pipeline topology — read by producer, feature job and scorer.
+topics:
+  raw: transactions.raw        # replayed IEEE-CIS rows (labeled)
+  scored: transactions.scored  # every scored transaction
+  alerts: transactions.alerts  # threshold-passing transactions only
+
+kafka:
+  partitions: 3
+  replication_factor: 1
+  message_key: card_key        # per-card ordering for correct velocity state
+  producer:
+    linger_ms: 5
+    compression: zstd
+    batch_size: 32768
+
+features_job:
+  trigger: 1 second
+  max_offsets_per_trigger: 400
+  watermark: 10 minutes
+  checkpoint_dir: checkpoints/features
+
+redis:
+  key_prefix: sg:card:
+  ttl_days: 7
+
+alerts:
+  risk_bands:
+    high: thr_high      # FPR ≤ 1% operating point (M5)
+    medium: thr_medium  # FPR ≤ 5% operating point
+    review: thr_review  # 90th percentile of val scores

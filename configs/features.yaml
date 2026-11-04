@@ -1,0 +1,35 @@
+# StreamGuard feature contract — SINGLE SOURCE OF TRUTH (PLAN.md §6).
+# Both the Spark online job (streaming/features_job.py) and the offline polars twin
+# (offline/features.py) build features from this file. The parity test asserts
+# they agree to 1e-6. v_subset is FROZEN at milestone M1 (EDA on train split only).
+
+key: card_key
+
+static:
+  - transaction_amt
+  - log_transaction_amt
+  - amt_over_card_mean_24h
+  - product_cd            # one-hot: W C R H S
+  - card4_onehot
+  - card6_onehot
+  - dist1
+  - dist2
+  - log_dist1
+  - p_emaildomain_group   # mapped to ~12 groups in offline/features.py
+  - r_emaildomain_group
+  - device_type_onehot
+  - hour_sin
+  - hour_cos
+  - dow_sin
+  - dow_cos
+
+m_flags: [m1, m2, m3, m4, m5, m6, m7, m8, m9]
+
+c_features: [c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14]
+
+v_subset: []   # ← frozen at M1: top-30 V-features by mutual information (train only)
+
+velocity:
+  windows: [5m, 1h, 24h, 7d]
+  metrics: [txn_count, amt_sum, amt_mean, uniq_merchants, time_since_last_txn]
+  sentinel_no_history: -1.0

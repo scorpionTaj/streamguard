@@ -1,0 +1,26 @@
+# environment
+.venv/
+.env
+
+# data & artifacts (never commit datasets)
+data/
+artifacts/
+mlruns/
+checkpoints/
+mlflow.db
+
+# python
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+
+# editors / os
+.DS_Store
+.idea/
+.vscode/
+
+# streamlit
+.streamlit/secrets.toml
