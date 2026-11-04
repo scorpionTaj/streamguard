@@ -3,7 +3,7 @@
 **Real-time fraud detection with an online feature store**
 Kafka → Spark Structured Streaming → Redis → hybrid scoring → live Streamlit alerts.
 
-> Status: 🚧 **in progress** — M0–M3 done (baseline val AUPRC 0.550; feature parity and live-vs-offline score parity both max |Δ| = 0); next: M4.
+> Status: 🚧 **in progress** — M0–M4 done (baseline val AUPRC 0.550; feature + score parity max |Δ| = 0; live dashboard, p95 ≈ 3.8 s @ ~175 tx/s); next: M5.
 > Companion doc: [README.md](./README.md) (concept). This document is the single source of truth for scope, contracts, KPIs and milestones.
 
 ---

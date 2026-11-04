@@ -50,7 +50,7 @@ drift:            ## PSI drift report vs training reference
 
 # ── Services (host) ──────────────────────────────────────────────────────────
 api:              ## FastAPI scorer + alerts (expects infra up)
-	uv run uvicorn streamguard.serving.main:app --host 0.0.0.0 --port 8000 --reload
+	uv run uvicorn streamguard.serving.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir src
 
 dashboard:        ## Streamlit alert dashboard (expects api up)
 	uv run streamlit run dashboard/app.py
