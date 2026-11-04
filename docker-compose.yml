@@ -16,11 +16,11 @@ services:
       - --memory
       - 1G
       - --overprovisioned
+      # two listeners: docker-internal (console, spark) and host (producer/scorer)
       - --kafka-addr
-      - PLAINTEXT://0.0.0.0:9092
+      - internal://0.0.0.0:29092,external://0.0.0.0:9092
       - --advertise-kafka-addr
-      # docker-internal listeners (spark) and host listener (producer/scorer)
-      - PLAINTEXT://redpanda:9092,OUTSIDE://localhost:9092
+      - internal://redpanda:29092,external://localhost:9092
     ports:
       - "9092:9092"
     volumes:
@@ -35,7 +35,7 @@ services:
     image: docker.redpanda.com/redpandadata/console:v2.7.2
     container_name: sg-console
     environment:
-      KAFKA_BROKERS: redpanda:9092
+      KAFKA_BROKERS: redpanda:29092
     ports:
       - "8085:8080"
     depends_on:
@@ -72,7 +72,7 @@ services:
       - spark.sql.shuffle.partitions=4
       - /opt/app/src/streamguard/streaming/features_job.py
     environment:
-      KAFKA_BOOTSTRAP: redpanda:9092
+      KAFKA_BOOTSTRAP: redpanda:29092
       REDIS_URL: redis://redis:6379/0
       FEATURES_CONFIG: /opt/app/configs/features.yaml
       CHECKPOINT_DIR: /opt/app/checkpoints/features

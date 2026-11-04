@@ -3,7 +3,7 @@
 **Real-time fraud detection with an online feature store**
 Kafka → Spark Structured Streaming → Redis → hybrid scoring → live Streamlit alerts.
 
-> Status: 📋 **planned** — implementation starts at Milestone M0.
+> Status: 🚧 **in progress** — M0 done (infra up, 1k real tx replayed); next: M1.
 > Companion doc: [README.md](./README.md) (concept). This document is the single source of truth for scope, contracts, KPIs and milestones.
 
 ---

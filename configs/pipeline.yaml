@@ -20,7 +20,7 @@ features_job:
   checkpoint_dir: checkpoints/features
 
 redis:
-  key_prefix: sg:card:
+  key_prefix: "sg:card:"
   ttl_days: 7
 
 alerts:
