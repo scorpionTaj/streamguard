@@ -76,6 +76,10 @@ services:
       - spark.driver.memory=1g
       - --conf
       - spark.sql.shuffle.partitions=4
+      - --conf
+      - spark.sql.adaptive.enabled=false  # unsupported in streaming; declared to silence the runtime warning
+      - --conf
+      - spark.driver.extraJavaOptions=-Dlog4j.configurationFile=/opt/app/docker/spark-log4j2.properties
       - /opt/app/src/streamguard/streaming/features_job.py
     environment:
       KAFKA_BOOTSTRAP: redpanda:29092

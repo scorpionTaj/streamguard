@@ -25,6 +25,7 @@ import json
 import os
 import re
 import time
+import warnings
 from collections.abc import Iterator
 
 import numpy as np
@@ -37,6 +38,12 @@ from streamguard.config import (
     velocity_window_seconds,
 )
 from streamguard.velocity import velocity_features
+
+# pyspark 4.0's Arrow serializers concat empty batches internally and trip pandas'
+# FutureWarning ~once per batch (upstream, not ours) — silence just that message.
+warnings.filterwarnings(
+    "ignore", message=".*DataFrame concatenation with empty or all-NA entries.*",
+    category=FutureWarning)  # fmt: skip
 
 # Velocity-state columns carried between micro-batches (one row per card).
 STATE_FIELDS = ("event_ts_s", "amt", "transaction_id")
