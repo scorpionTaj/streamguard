@@ -27,6 +27,7 @@ import numpy as np
 
 from streamguard.config import REPO_ROOT
 from streamguard.eval.metrics import precision_at_k, threshold_at_fpr
+from streamguard.models.registry import MODEL_NAME, ensure_champion
 from streamguard.offline.features import build_training_frame, feature_columns, temporal_split
 
 log = logging.getLogger("streamguard.train")
@@ -67,7 +68,9 @@ def evaluate(y_true: np.ndarray, y_score: np.ndarray) -> dict[str, float]:
         "roc_auc": float(roc_auc_score(y_true, y_score)),
         "recall_at_fpr_1pct": at_1.recall,
         "recall_at_fpr_5pct": at_5.recall,
+        "threshold_at_fpr_1pct": at_1.threshold,
         "threshold_at_fpr_5pct": at_5.threshold,
+        "score_p90": float(np.quantile(y_score, 0.90)),  # review-band floor (PLAN.md §9)
         "precision_at_50": precision_at_k(y_true, y_score, 50),
     }
 
@@ -132,8 +135,9 @@ def train_xgboost(limit: int = 0) -> dict[str, float]:
             (Path(tmp) / "feature_columns.json").write_text(json.dumps(columns))
             mlflow.log_artifacts(tmp)
         mlflow.log_artifact(str(FEATURES_YAML))
-        mlflow.xgboost.log_model(booster, name="model")
+        info = mlflow.xgboost.log_model(booster, name="model", registered_model_name=MODEL_NAME)
         log.info("run %s: %s", run.info.run_id, json.dumps(metrics, indent=2))
+    ensure_champion(info.registered_model_version)
     return metrics
 
 

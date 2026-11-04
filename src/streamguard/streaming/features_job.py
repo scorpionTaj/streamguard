@@ -6,8 +6,10 @@
    events inside the longest window (+ the last event for time_since_last_txn);
    each micro-batch runs the shared numpy kernel (streamguard.velocity) over
    state + new events, ordered by (event_ts, transaction_id) = replay order.
-3. foreachBatch → one Redis hash per card (HSET sg:card:<card_key>, TTL from
-   pipeline.yaml), latest event per card wins, pipelined.
+3. foreachBatch, pipelined: one Redis hash per card (HSET sg:card:<card_key>,
+   TTL 7d, latest event per card wins) + one per event (sg:tx:<transaction_id>,
+   short TTL) — the scorer waits for the event's own snapshot, so serving sees
+   exactly the training-time features.
 4. Checkpoint to CHECKPOINT_DIR for state recovery.
 
 State has no timeout on purpose: dropping an idle card would reset its
@@ -96,7 +98,7 @@ def latest_per_card(batch: pd.DataFrame) -> pd.DataFrame:
 
 
 def redis_mapping(row: pd.Series, feature_names: list[str]) -> dict[str, str]:
-    """Hash fields for one card. repr() round-trips floats exactly (parity needs 1e-6)."""
+    """Hash fields for one snapshot. repr() round-trips floats exactly (parity needs 1e-6)."""
     mapping = {"transaction_id": str(int(row["transaction_id"])),
                "event_ts_s": repr(float(row["event_ts_s"]))}  # fmt: skip
     mapping.update({name: repr(float(row[name])) for name in feature_names})
@@ -181,6 +183,10 @@ def main() -> None:
             return
         client = redis.Redis.from_url(redis_url)
         with client.pipeline(transaction=False) as pipe:
+            for _, row in rows.iterrows():
+                key = f"{redis_cfg['tx_key_prefix']}{int(row['transaction_id'])}"
+                pipe.hset(key, mapping=redis_mapping(row, feature_names))
+                pipe.expire(key, int(redis_cfg["tx_ttl_seconds"]))
             for _, row in latest_per_card(rows).iterrows():
                 key = redis_card_key(redis_cfg["key_prefix"], row["card_key"])
                 pipe.hset(key, mapping=redis_mapping(row, feature_names))

@@ -3,7 +3,7 @@
 **Real-time fraud detection with an online feature store**
 Kafka → Spark Structured Streaming → Redis → hybrid scoring → live Streamlit alerts.
 
-> Status: 🚧 **in progress** — M0–M2 done (baseline val AUPRC 0.550; online/offline parity max |Δ| = 0); next: M3.
+> Status: 🚧 **in progress** — M0–M3 done (baseline val AUPRC 0.550; feature parity and live-vs-offline score parity both max |Δ| = 0); next: M4.
 > Companion doc: [README.md](./README.md) (concept). This document is the single source of truth for scope, contracts, KPIs and milestones.
 
 ---
@@ -170,7 +170,9 @@ velocity:
 
 111 features total after one-hot (M1).
 
-**Velocity semantics (M2, shared kernel `src/streamguard/velocity.py`):** for event *i* of card *k* at event time *t*, window *W* covers card *k*'s events *j ≤ i* (replay order = `(event_ts, transaction_id)`) with *t_j > t − W* — the snapshot **after** processing event *i*. Sums are exact (integer thousandths). The Spark job runs the same numpy kernel inside `applyInPandasWithState` (state = card events within 7d + last event, no timeout), and writes the card's latest snapshot to Redis `sg:card:<card_key>` = `{transaction_id, event_ts_s, <velocity features>}`. Static features are derived from the event itself by the scorer, not stored. Null policy: `v`/`dist`/`device` nulls → XGBoost native NaN handling; AE input uses train-median imputation + missing-mask channel.
+**Velocity semantics (M2, shared kernel `src/streamguard/velocity.py`):** for event *i* of card *k* at event time *t*, window *W* covers card *k*'s events *j ≤ i* (replay order = `(event_ts, transaction_id)`) with *t_j > t − W* — the snapshot **after** processing event *i*. Sums are exact (integer thousandths). The Spark job runs the same numpy kernel inside `applyInPandasWithState` (state = card events within 7d + last event, no timeout), and writes the card's latest snapshot to Redis `sg:card:<card_key>` = `{transaction_id, event_ts_s, <velocity features>}`. Static features are derived from the event itself by the scorer, not stored.
+
+**Serving parity (M3):** Spark also writes a per-event snapshot `sg:tx:<transaction_id>` (TTL 600 s). The scorer waits for the event's own snapshot (≤ 10 s, else NaN velocity + `streamguard_feature_misses_total`) and builds the vector with the offline twin's code → live scores equal offline predictions (M3 run: 5 k events, max |Δscore| = 0, 0 misses). The snapshot wait is part of the measured end-to-end latency. Null policy: `v`/`dist`/`device` nulls → XGBoost native NaN handling; AE input uses train-median imputation + missing-mask channel.
 
 ---
 
@@ -205,7 +207,7 @@ velocity:
 
 **Ensemble:** `score = w · xgb_prob + (1-w) · ae_percentile`, `w` swept {0.5…1.0} on val for max AUPRC (expect w≈0.8–0.9; AE is the "unknown unknowns" lane, reported separately too).
 
-**Threshold policy:** operating point = **max recall s.t. FPR ≤ 5 %** on val; report recall + alert precision@50 at that point. Risk bands: high ≥ `thr_high` (FPR ≤ 1 %), medium ≥ 5 %-thr, review 90th-percentile score.
+**Threshold policy:** operating point = **max recall s.t. FPR ≤ 5 %** on val; report recall + alert precision@50 at that point. Risk bands: high ≥ `thr_high` (FPR ≤ 1 %), medium ≥ 5 %-thr, review 90th-percentile score. Thresholds are logged as val metrics on each training run, and the scorer reads them from the served version's run, so model and operating point move together.
 
 **Explainability:** per-alert SHAP (TreeExplainer, top-5 |impact| features), computed async, attached to the Alert record.
 

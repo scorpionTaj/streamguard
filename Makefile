@@ -29,11 +29,12 @@ replay:           ## replay dataset into transactions.raw (limit with REPLAY_LIM
 features:         ## run the Spark Structured Streaming feature job (in container)
 	docker compose up --build spark-features
 
-reset:            ## fresh stream: drop topics, Redis card hashes and Spark state (keeps infra up)
+reset:            ## fresh stream: drop topics, scorer offsets, Redis snapshots, Spark state (stop `make api` first)
 	-docker compose rm -sf spark-features
 	-docker volume rm streamguard_spark-checkpoints
 	-docker exec sg-redpanda rpk topic delete transactions.raw transactions.scored transactions.alerts
-	docker exec sg-redis sh -c "redis-cli --scan --pattern 'sg:card:*' | xargs -r redis-cli del" >/dev/null
+	-docker exec sg-redpanda rpk group delete scorer
+	docker exec sg-redis sh -c "redis-cli --scan --pattern 'sg:*' | xargs -r redis-cli del" >/dev/null
 
 train:            ## train XGBoost + AE, log to MLflow, evaluate on temporal test
 	uv run python -m streamguard.models.train

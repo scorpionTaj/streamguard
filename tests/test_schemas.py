@@ -64,7 +64,9 @@ class TestTransaction:
 
 class TestScoredAndAlert:
     def test_scoredtx_inherits_transaction(self):
-        scored = ScoredTx(**make_transaction(), score=0.93, model_version="v7", scored_at=datetime.now(UTC))
+        scored = ScoredTx(
+            **make_transaction(), score=0.93, model_version="v7", scored_at=datetime.now(UTC)
+        )
         assert scored.score == 0.93
         assert scored.transaction_amt == 129.95
 

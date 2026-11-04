@@ -14,6 +14,7 @@ for event i of card k at event time t, window W covers card k's events j ≤ i
 from __future__ import annotations
 
 import math
+import typing
 from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
 
@@ -73,6 +74,22 @@ def email_domain_group(domain: str | None) -> str:
 # ── Contract events → frame ──────────────────────────────────────────────────
 
 
+_POLARS_TYPES = {int: pl.Int64, float: pl.Float64, str: pl.Utf8, bool: pl.Boolean,
+                 datetime: pl.Datetime("us", "UTC")}  # fmt: skip
+
+
+def _contract_schema() -> dict[str, pl.DataType]:
+    """Column types from the Transaction contract, so an all-null batch column keeps its
+    type (inference would give dtype Null and break the feature expressions)."""
+    schema = {}
+    for name, info in Transaction.model_fields.items():
+        if name == "v":
+            continue
+        kinds = [a for a in typing.get_args(info.annotation) if a is not type(None)]
+        schema[name] = _POLARS_TYPES[kinds[0] if kinds else info.annotation]
+    return schema
+
+
 def transactions_frame(txs: Iterable[Transaction], v_subset: list[str]) -> pl.DataFrame:
     """Flatten contract events into one row each; `v` becomes columns (missing → null)."""
     rows = []
@@ -81,7 +98,8 @@ def transactions_frame(txs: Iterable[Transaction], v_subset: list[str]) -> pl.Da
         row["event_ts_s"] = (tx.event_ts - _EPOCH).total_seconds()
         row.update({name: tx.v.get(name) for name in v_subset})
         rows.append(row)
-    return pl.DataFrame(rows, schema_overrides={name: pl.Float64 for name in v_subset})
+    schema = _contract_schema() | {"event_ts_s": pl.Float64} | dict.fromkeys(v_subset, pl.Float64)
+    return pl.DataFrame(rows, schema=schema)
 
 
 def load_transactions(limit: int = 0, v_subset: list[str] | None = None) -> pl.DataFrame:
@@ -140,18 +158,25 @@ _STATIC: dict[str, Callable[[], list[pl.Expr]]] = {
 }
 
 
-def build_features(frame: pl.DataFrame, spec: dict | None = None) -> pl.DataFrame:
-    """Contract frame → [transaction_id, event_ts, is_fraud, *feature_columns(spec)]."""
+def build_features(
+    frame: pl.DataFrame, spec: dict | None = None, velocity: dict[str, np.ndarray] | None = None
+) -> pl.DataFrame:
+    """Contract frame → [transaction_id, event_ts, is_fraud, *feature_columns(spec)].
+
+    `velocity` = precomputed per-row velocity columns (the scorer passes the Spark
+    snapshots read from Redis); by default it is computed over `frame` itself.
+    """
     spec = spec or load_feature_spec()
-    velocity_cfg = spec["velocity"]
-    velocity = velocity_features(
-        frame[spec["key"]].to_numpy(),
-        frame["event_ts_s"].to_numpy(),
-        frame["transaction_amt"].to_numpy(),
-        velocity_window_seconds(spec),
-        velocity_cfg["metrics"],
-        float(velocity_cfg.get("sentinel_no_history", -1.0)),
-    )
+    if velocity is None:
+        velocity_cfg = spec["velocity"]
+        velocity = velocity_features(
+            frame[spec["key"]].to_numpy(),
+            frame["event_ts_s"].to_numpy(),
+            frame["transaction_amt"].to_numpy(),
+            velocity_window_seconds(spec),
+            velocity_cfg["metrics"],
+            float(velocity_cfg.get("sentinel_no_history", -1.0)),
+        )
     unknown = [name for name in spec["static"] if name not in _STATIC]
     if unknown:
         raise ValueError(f"no offline implementation for static features: {unknown}")

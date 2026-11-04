@@ -20,8 +20,10 @@ features_job:
   checkpoint_dir: checkpoints/features
 
 redis:
-  key_prefix: "sg:card:"
+  key_prefix: "sg:card:"     # latest velocity snapshot per card (online feature store view)
   ttl_days: 7
+  tx_key_prefix: "sg:tx:"    # per-event snapshot the scorer waits for (exact training parity)
+  tx_ttl_seconds: 600        # ≈ 120k keys at 200 tx/s
 
 alerts:
   risk_bands:
