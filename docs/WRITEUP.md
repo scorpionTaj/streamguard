@@ -1,0 +1,18 @@
+# StreamGuard — one-page write-up
+
+**Goal.** Build a real-time fraud-detection system on one laptop and measure it honestly: labeled data, a temporal evaluation, end-to-end latency, and a model-operations loop that runs rather than sits on a diagram.
+
+**System.** A replay producer streams 590 k real IEEE-CIS transactions into Redpanda on a compressed clock. A Spark Structured Streaming job keeps per-card velocity state over 5 m / 1 h / 24 h / 7 d windows and writes it to Redis. A FastAPI scorer reads each event's own Redis snapshot, scores it with the MLflow `champion` (and a `challenger` canary), and publishes alerts with SHAP explanations. A Streamlit dashboard and Grafana show it live.
+
+**What was hard, and how it was solved.**
+
+1. *Online/offline consistency.* Velocity features drift easily between a batch training pipeline and a streaming job. StreamGuard keeps one input contract (the producer's `Transaction` events) and **one velocity function** that both the polars twin and Spark execute. Sums are exact (integer thousandths), and window semantics are pinned down: event-inclusive, ties resolved in replay order. Result: `make parity` reports max |Δ| = **0** on 60 k events over 152 micro-batches.
+2. *Training/serving skew.* Training features include the current event, but a per-card store only holds the latest state, which could be from before or after the event being scored. Spark also writes a per-event snapshot with a 10-minute TTL, and the scorer waits for it. Live scores equal offline predictions exactly. The wait costs about 1.4 s at p50, and it shows up in the latency budget rather than being hidden.
+3. *An honest metric.* Published PR-AUC figures of 0.78–0.88 come from other datasets. Measured here: the all-columns XGBoost ceiling is 0.561 on validation and 0.510 on test. StreamGuard's 111 streaming-safe features reach **0.489 on test (96 % of that ceiling)**. Two feature-contract decisions came from ablations: adding the D1–D15 timedeltas and anonymized card/address IDs raised validation AUPRC from 0.496 to 0.547.
+4. *Two ML runtimes in one process.* On macOS, PyTorch and XGBoost each bundle an OpenMP runtime. I reproduced both failure modes in isolation: importing torch first leads to a segfault, and two active thread pools deadlock. One import helper fixes the load order and pins torch to a single thread.
+
+**Model-ops loop, exercised live.** A seed-7 retrain (v4, whose sweep switched on 5 % of the autoencoder lane) ran as a canary against v3 on 12 k events. Its 95th-percentile score delta was 0.118 (the challenger scored 0.034 higher on average), with 97.3 % of alert decisions agreeing, so `make promote` **refused** it, as it should. A forced promote followed by `make rollback` restored v3 in two commands. The PSI monitor runs every 30 s, and its first live firing taught the most: on a short window it flagged features inside the training period itself, so a fixed 0.2 threshold is not meaningful at this window length (next step: calibrate it from window-to-window PSI within the training data).
+
+**Numbers.** Test AUPRC 0.489 (ROC-AUC 0.884, recall 0.59 at 5 % FPR, precision@50 = 1.0); end-to-end p95 4.17 s at 177 tx/s; feature and score parity exactly 0; 75 tests.
+
+**What I'd do next.** Calibrate the drift threshold; try Spark's real-time trigger mode to cut the p99; retrain on a rolling window and let the canary decide; give the autoencoder lane a reason to exist (for example, card-level sequence features), or drop it.

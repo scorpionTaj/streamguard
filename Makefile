@@ -75,5 +75,6 @@ format:
 	uv run ruff format .
 
 demo:             ## the demo sequence (run each in its own terminal)
-	@echo "1) make up        2) make mlflow       3) make replay"
+	@echo "1) make up        2) make mlflow       3) make train (once)"
 	@echo "4) make features  5) make api          6) make dashboard"
+	@echo "7) REPLAY_LIMIT=20000 make replay      8) make bench / make drift / make parity"
