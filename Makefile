@@ -36,7 +36,7 @@ reset:            ## fresh stream: drop topics, scorer offsets, Redis snapshots,
 	-docker exec sg-redpanda rpk group delete scorer
 	docker exec sg-redis sh -c "redis-cli --scan --pattern 'sg:*' | xargs -r redis-cli del" >/dev/null
 
-train:            ## train XGBoost + AE, log to MLflow, evaluate on temporal test
+train:            ## train XGBoost, log to MLflow, evaluate on temporal test
 	uv run python -m streamguard.models.train
 
 parity:           ## online vs offline feature parity check (fails CI on drift)
@@ -44,9 +44,15 @@ parity:           ## online vs offline feature parity check (fails CI on drift)
 
 bench:            ## end-to-end latency benchmark → artifacts/bench.json
 	uv run python -m streamguard.eval.latency
+resilience-mark:      ## record raw-topic offsets before a resilience drill
+	uv run python scripts/measure_resilience.py mark --state artifacts/resilience.json
+resilience-measure:   ## measure completeness/duplicates for the marked window (SINCE=ISO, optional)
+	uv run python scripts/measure_resilience.py measure --state artifacts/resilience.json $(if $(SINCE),--since $(SINCE),)
 
 drift:            ## PSI drift report vs training reference
 	uv run python -m streamguard.eval.drift
+watch-drift:      ## poll drift; 3 consecutive flags → auto-retrain a challenger (promotion stays manual)
+	uv run python -m streamguard.ops.watch
 
 promote:          ## challenger → champion if the live canary is within tolerance (scorer swaps within ~30 s)
 	uv run python -m streamguard.models.registry promote
