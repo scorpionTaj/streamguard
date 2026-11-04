@@ -173,6 +173,11 @@ def main() -> None:
     state_schema = StructType([StructField("history_json", StringType())])
 
     def per_card(key: tuple, pdfs: Iterator[pd.DataFrame], state) -> Iterator[pd.DataFrame]:
+        # inside the worker: pyspark overrides PYTHONWARNINGS, so filter here where the
+        # Arrow-concat FutureWarning actually fires (once per worker, negligible cost)
+        warnings.filterwarnings(
+            "ignore", message=".*DataFrame concatenation with empty or all-NA entries.*",
+            category=FutureWarning)  # fmt: skip
         history = json.loads(state.get[0]) if state.exists else None
         new_events = pd.concat(list(pdfs), ignore_index=True)
         out, new_state = update_card(key[0], history, new_events, spec)

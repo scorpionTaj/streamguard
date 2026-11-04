@@ -87,7 +87,11 @@ services:
       FEATURES_CONFIG: /opt/app/configs/features.yaml
       PIPELINE_CONFIG: /opt/app/configs/pipeline.yaml
       CHECKPOINT_DIR: /opt/app/checkpoints/features
+      # PYTHONWARNINGS reaches the forked applyInPandasWithState workers; the driver's
+      # warnings.filterwarnings does not (pyspark 4.0 Arrow-concat FutureWarning, upstream)
+      PYTHONWARNINGS: "ignore:.*DataFrame concatenation with empty or all-NA entries"
     mem_limit: 2g
+    restart: unless-stopped  # a dead query restarts from its checkpoint; see PLAN.md runbook
     user: root   # named volumes mount root-owned; the job only writes checkpoints/ivy there
     volumes:
       - ./:/opt/app
