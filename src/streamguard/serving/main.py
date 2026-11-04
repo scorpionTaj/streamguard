@@ -6,8 +6,11 @@ The lifespan loads the MLflow `champion` alias and starts the consumer loop
     GET /alerts        alerts newer than ?since=<ISO datetime> (Streamlit polls every 2 s)
     GET /alerts/{id}   one alert incl. async SHAP top drivers
     GET /stats         counters: tx scored, alerts by band, feature misses
+    GET /canary        champion vs challenger score deltas (promotion gate)
+    GET /drift         PSI per feature vs the training reference
+    GET /latency       per-event spans for `make bench`
     GET /metrics       Prometheus exposition
-Canary (M6): serving/canary.py scores with the challenger too.
+With a `challenger` alias the scorer also scores every event with it (canary).
 """
 
 from __future__ import annotations
@@ -31,20 +34,31 @@ state = ScorerState()
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    from streamguard.models.registry import load_alias
+    from streamguard.eval.drift import DriftMonitor, load_reference, top_features
+    from streamguard.models.registry import CHALLENGER, load_alias, load_optional
 
     load_dotenv()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     model = load_alias()  # fail fast: no champion → no scorer
+    challenger = load_optional(CHALLENGER)
+    reference = load_reference(model.run_id)
+    drift = None
+    if reference is not None:
+        sample, names = reference
+        drift = DriftMonitor(sample, names, top_features(model.model.booster))
+    else:
+        log.warning("champion v%s has no drift reference — PSI monitoring off", model.version)
     scorer = Scorer(
         model, load_feature_spec(), load_pipeline_config(), state,
         os.getenv("KAFKA_BOOTSTRAP", "localhost:9092"),
         os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+        challenger=challenger, drift=drift,
     )  # fmt: skip
     stop = threading.Event()
     thread = threading.Thread(target=scorer.run, args=(stop,), name="scorer", daemon=True)
     thread.start()
-    log.info("scoring with %s v%s", "champion", model.version)
+    log.info("scoring with champion v%s%s", model.version,
+             f", canary vs challenger v{challenger.version}" if challenger else "")  # fmt: skip
     yield
     stop.set()
     thread.join(timeout=15)
@@ -92,6 +106,33 @@ def stats() -> dict:
             "feature_misses": state.feature_misses,
             "model_version": state.model_version,
         }
+
+
+@app.get("/canary")
+def canary() -> dict:
+    """Champion vs challenger over the recent window (registry.promote reads this)."""
+    base = {"champion_version": state.model_version, "challenger_version": state.challenger_version}
+    if state.canary is None:
+        return base | {"events": 0, "within_tolerance": False, "detail": "no challenger alias"}
+    return base | state.canary.summary()
+
+
+@app.get("/drift")
+def drift() -> dict:
+    """Latest PSI per feature vs the champion's training reference (eval/drift.py)."""
+    if state.drift is None:
+        return {"rows": 0, "features": {}, "detail": "no drift reference for this champion"}
+    return state.drift.latest if state.drift.latest["features"] else state.drift.compute()
+
+
+@app.get("/latency")
+def latency(limit: int = Query(20_000, ge=1, le=100_000)) -> dict:
+    """Recent per-event spans for `make bench` (epoch seconds)."""
+    fields = ("transaction_id", "created", "consumed", "snapshot_written",
+              "features_ready", "scored", "published")  # fmt: skip
+    with state.lock:
+        spans = list(state.spans)[-limit:]
+    return {"fields": fields, "spans": spans}
 
 
 @app.get("/metrics")

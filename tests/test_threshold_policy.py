@@ -57,6 +57,14 @@ class TestPsi:
         actual = rng.normal(1.5, 1, 10_000)
         assert psi(expected, actual) > 0.25
 
+    def test_missing_share_shift_flags(self):
+        rng = np.random.default_rng(0)
+        values = rng.normal(0, 1, 10_000)
+        mostly_missing = np.where(rng.random(10_000) < 0.6, np.nan, values)
+        assert psi(values, values) < 1e-6
+        assert psi(values, mostly_missing) > 0.25
+        assert np.isfinite(psi(np.full(100, np.nan), values))
+
     def test_empty_input_rejected(self):
         with pytest.raises(ValueError):
             psi(np.array([1.0]), np.array([]))

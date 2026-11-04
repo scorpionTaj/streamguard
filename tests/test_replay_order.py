@@ -94,6 +94,10 @@ class TestReplayFrame:
     def test_limit(self, csvs):
         assert load_replay_frame([], 1, *csvs).height == 1
 
+    def test_offset_continues_in_replay_order(self, csvs):
+        rest = load_replay_frame([], 0, *csvs, offset=1)
+        assert rest["TransactionID"].to_list() == [2]
+
 
 def test_pipeline_config_parses():
     from streamguard.config import load_pipeline_config

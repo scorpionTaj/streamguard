@@ -8,10 +8,12 @@ One background thread, consumer group `scorer` on `transactions.raw`:
         2. static features from the event via the offline twin (same code as training)
         3. champion hybrid score (XGBoost + autoencoder, batched)
         4. publish ScoredTx → transactions.scored; band-passing → Alert → transactions.alerts
+           (with a challenger alias: score twice, record the canary delta — PLAN.md §10)
         5. SHAP top-5 for the batch's alerts on a background worker (never blocks publish);
            drivers land on the API's alert records (GET /alerts/{transaction_id})
 Offsets are stored only after publishing (at-least-once). Prometheus metrics are
-module-level and exported by main.py /metrics.
+module-level and exported by main.py /metrics; a side thread recomputes feature
+PSI (eval/drift.py) and the loop refreshes consumer lag every few seconds.
 """
 
 from __future__ import annotations
@@ -26,12 +28,14 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 import numpy as np
-from prometheus_client import Counter, Histogram
+from prometheus_client import Counter, Gauge, Histogram
 
+from streamguard.eval.drift import DriftMonitor
 from streamguard.models.explainer import top_drivers
 from streamguard.models.registry import ServingModel, Thresholds
 from streamguard.offline.features import build_features, transactions_frame
 from streamguard.schemas import Alert, RiskBand, ScoredTx, Transaction
+from streamguard.serving.canary import CanaryWindow
 from streamguard.streaming.features_job import velocity_columns
 
 log = logging.getLogger("streamguard.scorer")
@@ -49,6 +53,12 @@ EXPLAIN = Histogram("streamguard_explain_seconds", "Async SHAP per alert batch",
                     buckets=(0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1))  # fmt: skip
 E2E = Histogram("streamguard_e2e_latency_seconds", "Producer send → scored/alert published",
                 buckets=(0.25, 0.5, 1, 1.5, 2, 3, 4, 5, 7.5, 10, 20))  # fmt: skip
+CONSUMER_LAG = Gauge(
+    "streamguard_consumer_lag_messages", "transactions.raw messages not yet scored"
+)
+
+LAG_EVERY_S = 5.0
+DRIFT_EVERY_S = 30.0
 
 
 def risk_band(score: float, thresholds: Thresholds) -> RiskBand | None:
@@ -71,14 +81,24 @@ class ScorerState:
     by_band: TallyCounter = field(default_factory=TallyCounter)
     feature_misses: int = 0
     model_version: str = ""
+    challenger_version: str | None = None
     error: str | None = None
+    canary: CanaryWindow | None = None
+    drift: DriftMonitor | None = None
+    # per-event latency spans for `make bench`: (tx_id, created, consumed, snapshot_written,
+    # features_ready, scored, published) — epoch seconds
+    spans: deque = field(default_factory=lambda: deque(maxlen=100_000))
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 def fetch_snapshots(redis_client, prefix: str, ids: list[int], names: list[str],
-                    wait_s: float) -> dict[int, dict[str, float]]:  # fmt: skip
-    """Poll Redis until every event's snapshot exists or `wait_s` passes."""
+                    wait_s: float) -> tuple[dict[int, dict[str, float]], dict[int, float]]:  # fmt: skip
+    """Poll Redis until every event's snapshot exists or `wait_s` passes.
+
+    Returns (velocity features per tx, Spark write time per tx — for latency spans).
+    """
     found: dict[int, dict[str, float]] = {}
+    written: dict[int, float] = {}
     pending, deadline = list(dict.fromkeys(ids)), time.monotonic() + wait_s
     while pending:
         with redis_client.pipeline(transaction=False) as pipe:
@@ -88,11 +108,12 @@ def fetch_snapshots(redis_client, prefix: str, ids: list[int], names: list[str],
         for tx_id, raw in zip(pending, results, strict=True):
             if raw:
                 found[tx_id] = {n: float(raw[n.encode()]) for n in names}
+                written[tx_id] = float(raw.get(b"written_at", "nan"))
         pending = [i for i in pending if i not in found]
         if not pending or time.monotonic() >= deadline:
             break
         time.sleep(0.02)
-    return found
+    return found, written
 
 
 def score_events(txs: list[Transaction], snapshots: dict[int, dict[str, float]],
@@ -108,7 +129,9 @@ def score_events(txs: list[Transaction], snapshots: dict[int, dict[str, float]],
 
 class Scorer:
     def __init__(self, model: ServingModel, spec: dict, pipeline: dict, state: ScorerState,
-                 bootstrap: str, redis_url: str, wait_s: float = 10.0) -> None:  # fmt: skip
+                 bootstrap: str, redis_url: str, wait_s: float = 10.0,
+                 challenger: ServingModel | None = None,
+                 drift: DriftMonitor | None = None) -> None:  # fmt: skip
         import redis
         from confluent_kafka import Consumer, Producer
 
@@ -126,14 +149,29 @@ class Scorer:
         self.explainer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="shap")
         self.consumer.subscribe([pipeline["topics"]["raw"]])
         state.model_version = model.version
+        if challenger is not None and challenger.feature_names != model.feature_names:
+            log.warning("challenger v%s has a different feature set — canary disabled",
+                        challenger.version)  # fmt: skip
+            challenger = None
+        self.challenger = challenger
+        state.challenger_version = challenger.version if challenger else None
+        state.canary = CanaryWindow() if challenger else None
+        state.drift = drift
+        self._next_lag = 0.0
 
     def run(self, stop: threading.Event) -> None:
+        if self.state.drift is not None:
+            threading.Thread(
+                target=self._drift_loop, args=(stop,), name="drift", daemon=True
+            ).start()
         try:
             while not stop.is_set():
                 messages = [m for m in self.consumer.consume(500, timeout=0.5) if not m.error()]
                 if messages:
                     self.process(messages)
                 self.producer.poll(0)
+                if time.monotonic() >= self._next_lag:
+                    self._update_lag()
         except Exception as exc:  # surfaced on /health instead of a silently dead thread
             log.exception("scorer loop crashed")
             self.state.error = repr(exc)
@@ -143,20 +181,65 @@ class Scorer:
             self.producer.flush(10)
             self.consumer.close()
 
+    def _update_lag(self) -> None:
+        """Messages on transactions.raw past the scorer's position (consumer thread only)."""
+        self._next_lag = time.monotonic() + LAG_EVERY_S
+        try:
+            assigned = self.consumer.assignment()
+            if not assigned:
+                return
+            # position() is invalid (< 0) until a partition yields its first message after a
+            # restart — an idle, caught-up scorer would read as "whole topic behind". Fall
+            # back to the committed offset, and skip partitions with neither.
+            committed = {(tp.topic, tp.partition): tp.offset
+                         for tp in self.consumer.committed(assigned, timeout=1.0)}  # fmt: skip
+            lag = 0
+            for tp in self.consumer.position(assigned):
+                offset = (
+                    tp.offset if tp.offset >= 0 else committed.get((tp.topic, tp.partition), -1)
+                )
+                if offset < 0:
+                    continue
+                _, high = self.consumer.get_watermark_offsets(tp, timeout=1.0, cached=False)
+                lag += max(0, high - offset)
+            CONSUMER_LAG.set(lag)
+        except Exception:  # monitoring must never take the scorer down
+            log.debug("lag update failed", exc_info=True)
+
+    def _drift_loop(self, stop: threading.Event) -> None:
+        while not stop.wait(DRIFT_EVERY_S):
+            try:
+                self.state.drift.compute()
+            except Exception:
+                log.exception("drift computation failed")
+
     def process(self, messages: list) -> None:
+        consumed_at = time.time()
         txs = [Transaction.model_validate_json(m.value()) for m in messages]
         started = time.monotonic()
-        snapshots = fetch_snapshots(self.redis, self.pipeline["redis"]["tx_key_prefix"],
-                                    [t.transaction_id for t in txs], self.velocity_names,
-                                    self.wait_s)  # fmt: skip
+        snapshots, written_at = fetch_snapshots(
+            self.redis, self.pipeline["redis"]["tx_key_prefix"],
+            [t.transaction_id for t in txs], self.velocity_names, self.wait_s,
+        )  # fmt: skip
         FEATURE_WAIT.observe(time.monotonic() - started)
+        features_at = time.time()
         with INFERENCE.time():
             scores, matrix = score_events(txs, snapshots, self.model, self.spec)
+        scored_at = time.time()
+        if self.challenger is not None:  # canary: score twice, champion alone drives alerts
+            challenger_scores = np.asarray(self.challenger.model.score(matrix), dtype=float)
+            self.state.canary.record(
+                scores, challenger_scores,
+                [risk_band(s, self.model.thresholds) is not None for s in scores],
+                [risk_band(s, self.challenger.thresholds) is not None for s in challenger_scores],
+            )  # fmt: skip
+        if self.state.drift is not None:
+            self.state.drift.add(matrix)
 
         topics, version = self.pipeline["topics"], self.model.version
         thresholds = self.model.thresholds
         floors = {"high": thresholds.high, "medium": thresholds.medium, "review": thresholds.review}
-        new_alerts, alert_rows, misses = [], [], 0
+        new_alerts, alert_rows, spans, misses = [], [], [], 0
         for row, (msg, tx, score) in enumerate(zip(messages, txs, scores, strict=True)):
             scored = ScoredTx(**tx.model_dump(), score=float(score), model_version=version,
                               scored_at=datetime.now(UTC))  # fmt: skip
@@ -172,7 +255,11 @@ class Scorer:
                 alert_rows.append(row)
                 ALERTS.labels(band).inc()
             self.consumer.store_offsets(msg)
-            E2E.observe(max(0.0, time.time() - msg.timestamp()[1] / 1000.0))
+            published_at, created_at = time.time(), msg.timestamp()[1] / 1000.0
+            E2E.observe(max(0.0, published_at - created_at))
+            spans.append((tx.transaction_id, created_at, consumed_at,
+                          written_at.get(tx.transaction_id, float("nan")),
+                          features_at, scored_at, published_at))  # fmt: skip
         self.producer.poll(0)
 
         SCORED.inc(len(txs))
@@ -182,6 +269,7 @@ class Scorer:
             self.state.feature_misses += misses
             self.state.alerts.extend(new_alerts)
             self.state.by_band.update(a.risk_band for a in new_alerts)
+            self.state.spans.extend(spans)
         if new_alerts:  # SHAP off the publish path (PLAN.md §3)
             self.explainer.submit(self.explain, new_alerts, matrix[alert_rows])
 

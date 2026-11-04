@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from collections.abc import Iterator
 
 import numpy as np
@@ -182,10 +183,12 @@ def main() -> None:
         if rows.empty:
             return
         client = redis.Redis.from_url(redis_url)
+        written_at = repr(time.time())  # latency span for `make bench`
         with client.pipeline(transaction=False) as pipe:
             for _, row in rows.iterrows():
                 key = f"{redis_cfg['tx_key_prefix']}{int(row['transaction_id'])}"
-                pipe.hset(key, mapping=redis_mapping(row, feature_names))
+                mapping = redis_mapping(row, feature_names) | {"written_at": written_at}
+                pipe.hset(key, mapping=mapping)
                 pipe.expire(key, int(redis_cfg["tx_ttl_seconds"]))
             for _, row in latest_per_card(rows).iterrows():
                 key = redis_card_key(redis_cfg["key_prefix"], row["card_key"])

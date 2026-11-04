@@ -112,10 +112,12 @@ class _FakeRedis:
 
 class TestFetchSnapshots:
     def test_waits_until_present(self):
-        fake = _FakeRedis({"sg:tx:7": {b"txn_count_5m": b"2.0"}}, ready_after=2)
-        found = fetch_snapshots(fake, "sg:tx:", [7], ["txn_count_5m"], wait_s=5)
+        fake = _FakeRedis({"sg:tx:7": {b"txn_count_5m": b"2.0", b"written_at": b"1.5"}},
+                          ready_after=2)  # fmt: skip
+        found, written = fetch_snapshots(fake, "sg:tx:", [7], ["txn_count_5m"], wait_s=5)
         assert found == {7: {"txn_count_5m": 2.0}} and fake.polls == 3
+        assert written == {7: 1.5}
 
     def test_gives_up_after_deadline(self):
         fake = _FakeRedis({})
-        assert fetch_snapshots(fake, "sg:tx:", [1, 2], ["txn_count_5m"], wait_s=0.05) == {}
+        assert fetch_snapshots(fake, "sg:tx:", [1, 2], ["txn_count_5m"], wait_s=0.05) == ({}, {})

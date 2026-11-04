@@ -1,4 +1,4 @@
-.PHONY: setup data up down logs replay features reset train parity bench drift api dashboard mlflow test lint format demo clean
+.PHONY: setup data up down logs replay features reset train parity bench drift promote rollback api dashboard mlflow test lint format demo clean
 
 # ── Setup ────────────────────────────────────────────────────────────────────
 setup:            ## create venv + install all dependency groups
@@ -47,6 +47,12 @@ bench:            ## end-to-end latency benchmark → artifacts/bench.json
 
 drift:            ## PSI drift report vs training reference
 	uv run python -m streamguard.eval.drift
+
+promote:          ## challenger → champion if the live canary is within tolerance (then restart `make api`)
+	uv run python -m streamguard.models.registry promote
+
+rollback:         ## champion → the version it replaced (then restart `make api`)
+	uv run python -m streamguard.models.registry rollback
 
 # ── Services (host) ──────────────────────────────────────────────────────────
 api:              ## FastAPI scorer + alerts (expects infra up)

@@ -3,7 +3,7 @@
 **Real-time fraud detection with an online feature store**
 Kafka → Spark Structured Streaming → Redis → hybrid scoring → live Streamlit alerts.
 
-> Status: 🚧 **in progress** — M0–M5 done (val AUPRC 0.550 / test 0.489 vs all-columns test ceiling 0.510; parity max |Δ| = 0; live dashboard + SHAP, p95 ≈ 3.8 s @ ~175 tx/s); next: M6.
+> Status: 🚧 **in progress** — M0–M6 done (val AUPRC 0.550 / test 0.489 vs all-columns test ceiling 0.510; parity max |Δ| = 0; bench p95 4.17 s @ 177 tx/s; canary gate + PSI drift live in Grafana); next: M7.
 > Companion doc: [README.md](./README.md) (concept). This document is the single source of truth for scope, contracts, KPIs and milestones.
 
 ---
@@ -225,6 +225,12 @@ velocity:
 2. **Drift:** §8 PSI job → Prometheus gauge + Grafana panel; PSI > 0.2 on any top-20-importance feature = retrain flag in README runbook.
 3. **Retraining trigger (manual, documented):** drift flag or canary degradation → rerun `make train` with same code, new window → registry promotion flow.
 4. **Grafana boards (provisioned):** consume lag (s), tx/s, alert rate, p50/p95/p99 latency, Redis hit-rate, PSI heatmap, canary delta.
+
+**M6 implementation & results:**
+- `make train` registers each new version as **challenger** (the first ever becomes champion). The scorer scores every event with both aliases (`GET /canary`, `streamguard_canary_*`); `make promote` moves the alias only if p95 |Δ| < 0.02 over ≥ 1 k events, recording the canary stats + `previous_champion` as version tags; `make rollback` is one alias move. Restart `make api` to serve a new champion.
+- Canary run (12 k events, v3 champion vs v4 = seed-7 retrain with w = 0.95): p95 |Δ| **0.118**, mean Δ −0.034 (the 5 % AE lane shifts scores up), alert agreement 97.3 % → **promotion refused** by the gate (correct). Forced promote → rollback drill restored v3 in two commands.
+- Drift: 10 k-row train sample logged per run (`drift_reference.npz`); scorer recomputes PSI (NaN = own bin) every 30 s over the last 20 k events; flag = any top-20-gain feature > 0.2. Live: top-20 max PSI 0.135 (`c10`) → no flag. Caveat seen live: `dow_*` PSI ≫ 0.2 in short windows (a 12 k-event window spans ≈ 1 simulated week, so weekday mix can't match training) — not a top-20 feature; real slow drift visible on `d10` (0.34).
+- `make bench`: 12 k events continuing the stream @ 177 tx/s → end-to-end p50 **2.54 s**, p95 **4.17 s** (KPI < 5 s ✅), p99 6.85 s; Spark micro-batch + snapshot wait dominate, inference/publish ≈ 10 ms.
 
 ---
 

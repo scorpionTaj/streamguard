@@ -115,6 +115,7 @@ def load_replay_frame(
     limit: int = 0,
     transaction_csv: Path = DEFAULT_TRANSACTION_CSV,
     identity_csv: Path = DEFAULT_IDENTITY_CSV,
+    offset: int = 0,
 ) -> pl.DataFrame:
     """Contract columns of the transaction table, identity-joined, in TransactionDT order."""
     columns = ["TransactionID", "isFraud", "card1", *_FLOAT_COLS, *_STR_COLS, *v_subset]
@@ -129,8 +130,8 @@ def load_replay_frame(
         log.warning("%s missing — device_type/device_info will be null", identity_csv)
         tx = tx.with_columns(DeviceType=pl.lit(None, pl.Utf8), DeviceInfo=pl.lit(None, pl.Utf8))
     tx = tx.sort("TransactionDT", "TransactionID", maintain_order=True)
-    if limit > 0:
-        tx = tx.head(limit)
+    if offset or limit > 0:
+        tx = tx.slice(offset, limit if limit > 0 else None)
     return tx.collect()
 
 
@@ -164,8 +165,11 @@ def run(
     max_rate: float = DEFAULT_MAX_RATE_TX_PER_SEC,
     bootstrap: str = "localhost:9092",
     transaction_csv: Path = DEFAULT_TRANSACTION_CSV,
+    offset: int = 0,
 ) -> int:
     """Replay `limit` rows (0 = all 590,540) into `transactions.raw`. `speed=0` = max rate.
+
+    `offset` skips that many rows (in replay order) to continue an earlier replay.
 
     Returns the number of events delivered.
     """
@@ -175,7 +179,7 @@ def run(
     v_subset = load_feature_spec().get("v_subset") or []
     ensure_topics(bootstrap, pipeline)
 
-    frame = load_replay_frame(v_subset, limit, transaction_csv)
+    frame = load_replay_frame(v_subset, limit, transaction_csv, offset=offset)
     log.info("replaying %d rows (speed=%s, max_rate=%s tx/s)", frame.height, speed, max_rate)
 
     cfg = pipeline["kafka"]["producer"]
@@ -226,10 +230,12 @@ def main() -> None:
     parser.add_argument("--max-rate", type=float,
                         default=float(os.getenv("REPLAY_RATE_TX_PER_SEC", DEFAULT_MAX_RATE_TX_PER_SEC)))  # fmt: skip
     parser.add_argument("--source", type=Path, default=DEFAULT_TRANSACTION_CSV)
+    parser.add_argument("--offset", type=int, default=int(os.getenv("REPLAY_OFFSET", "0")),
+                        help="skip this many rows (continue an earlier replay)")  # fmt: skip
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     run(args.limit, args.speed, args.max_rate,
-        os.getenv("KAFKA_BOOTSTRAP", "localhost:9092"), args.source)  # fmt: skip
+        os.getenv("KAFKA_BOOTSTRAP", "localhost:9092"), args.source, args.offset)  # fmt: skip
 
 
 if __name__ == "__main__":

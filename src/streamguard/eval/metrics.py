@@ -55,22 +55,31 @@ def threshold_at_fpr(
 def psi(expected: np.ndarray, actual: np.ndarray, bins: int = 10, eps: float = 1e-6) -> float:
     """Population Stability Index between reference and live distributions.
 
-    Quantile-binned on `expected`; PSI > 0.2 is the retrain flag (PLAN.md §8).
+    Quantile-binned on the finite `expected` values; NaN (missing) is its own bin,
+    so a shift in the missing share counts as drift. PSI > 0.2 is the retrain flag
+    (PLAN.md §8).
     """
     expected = np.asarray(expected, dtype=float).ravel()
     actual = np.asarray(actual, dtype=float).ravel()
     if expected.size == 0 or actual.size == 0:
         raise ValueError("psi requires non-empty distributions")
 
-    edges = np.unique(np.quantile(expected, np.linspace(0.0, 1.0, bins + 1)))
-    if edges.size < 2:  # degenerate (constant) reference
-        edges = np.array([edges[0] - 0.5, edges[0] + 0.5])
-    edges[0], edges[-1] = -np.inf, np.inf
+    finite = expected[np.isfinite(expected)]
+    if finite.size:
+        edges = np.unique(np.quantile(finite, np.linspace(0.0, 1.0, bins + 1)))
+        if edges.size < 2:  # degenerate (constant) reference
+            edges = np.array([edges[0] - 0.5, edges[0] + 0.5])
+        edges[0], edges[-1] = -np.inf, np.inf
+    else:
+        edges = np.array([-np.inf, np.inf])
 
-    e_counts = np.histogram(expected, bins=edges)[0] / expected.size
-    a_counts = np.histogram(actual, bins=edges)[0] / actual.size
-    e_prop = np.clip(e_counts, eps, None)
-    a_prop = np.clip(a_counts, eps, None)
+    def proportions(values: np.ndarray) -> np.ndarray:
+        missing = np.isnan(values)
+        counts = np.histogram(values[~missing], bins=edges)[0]
+        return np.append(counts, missing.sum()) / values.size
+
+    e_prop = np.clip(proportions(expected), eps, None)
+    a_prop = np.clip(proportions(actual), eps, None)
     return float(np.sum((e_prop - a_prop) * np.log(e_prop / a_prop)))
 
 
