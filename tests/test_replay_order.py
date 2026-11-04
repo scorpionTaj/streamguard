@@ -56,14 +56,20 @@ class TestReplayFrame:
             + ",".join(f"C{i}" for i in range(1, 15))
             + ","
             + ",".join(f"M{i}" for i in range(1, 10))
+            + ","
+            + ",".join(f"D{i}" for i in range(1, 16))
             + ",V1,V2\n"
             # deliberately out of TransactionDT order, with nulls
             "2,1,90000,50.0,H,9500,111.0,150.0,visa,226.0,debit,325.0,87.0,,,gmail.com,gmail.com,"
             + ",".join(["2"] * 14)
-            + ",T,T,F,M0,,,,,,,0.5\n"
+            + ",T,T,F,M0,,,,,,"
+            + ",".join(["14.0"] + [""] * 14)
+            + ",,0.5\n"
             "1,0,86400,68.5,W,13926,,150.0,discover,142.0,credit,315.0,87.0,19.0,,,,"
             + ",".join(["1"] * 14)
-            + ",T,T,T,M2,F,T,,,,1.0,\n"
+            + ",T,T,T,M2,F,T,,,,"
+            + ",".join(["0.0"] + [""] * 14)
+            + ",1.0,\n"
         )
         identity = tmp_path / "train_identity.csv"
         identity.write_text("TransactionID,DeviceType,DeviceInfo\n2,mobile,iOS Device\n")
@@ -82,6 +88,8 @@ class TestReplayFrame:
         assert first.device_type is None
         assert second.device_type == "mobile" and second.is_fraud == 1
         assert second.c14 == 2.0
+        assert (first.card1, first.card2, first.addr1) == (13926, None, 315.0)
+        assert (first.d1, second.d1, second.d2) == (0.0, 14.0, None)
 
     def test_limit(self, csvs):
         assert load_replay_frame([], 1, *csvs).height == 1

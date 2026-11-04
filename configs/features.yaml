@@ -23,13 +23,20 @@ static:
   - dow_sin
   - dow_cos
 
-m_flags: [m1, m2, m3, m4, m5, m6, m7, m8, m9]
+# m4 holds categories (M0/M1/M2), not T/F → null under the bool contract, so it is excluded.
+m_flags: [m1, m2, m3, m5, m6, m7, m8, m9]
 
 c_features: [c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14]
 
-v_subset: []   # ← frozen at M1: top-30 V-features by mutual information (train only)
+# Added at M1 (ablation: val AUPRC 0.496 → 0.547). Passed through as-is; XGBoost handles NaN.
+raw_ids: [card1, card2, card3, card5, addr1, addr2]   # anonymized dataset IDs, not PANs
+d_features: [d1, d2, d3, d4, d5, d6, d7, d8, d9, d10, d11, d12, d13, d14, d15]
+
+v_subset: [V187, V258, V201, V243, V257, V246, V244, V200, V199, V242, V190, V186, V259, V232, V218, V219, V178, V222, V233, V229, V179, V230, V168, V171, V265, V217, V231, V264, V177, V204]   # frozen at M1: top-30 by MI, train split only
 
 velocity:
   windows: [5m, 1h, 24h, 7d]
-  metrics: [txn_count, amt_sum, amt_mean, uniq_merchants, time_since_last_txn]
+  # uniq_merchants dropped at M1: IEEE-CIS has no merchant field (and exact streaming
+  # distinct counts would break 1e-6 parity). time_since_last_txn is window-independent.
+  metrics: [txn_count, amt_sum, amt_mean, time_since_last_txn]
   sentinel_no_history: -1.0

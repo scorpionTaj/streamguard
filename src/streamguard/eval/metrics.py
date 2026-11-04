@@ -72,3 +72,13 @@ def psi(expected: np.ndarray, actual: np.ndarray, bins: int = 10, eps: float = 1
     e_prop = np.clip(e_counts, eps, None)
     a_prop = np.clip(a_counts, eps, None)
     return float(np.sum((e_prop - a_prop) * np.log(e_prop / a_prop)))
+
+
+def precision_at_k(y_true: np.ndarray, y_score: np.ndarray, k: int = 50) -> float:
+    """Share of true frauds among the k highest-scored events (alert-queue precision)."""
+    y_true = np.asarray(y_true).astype(bool)
+    y_score = np.asarray(y_score, dtype=float)
+    if y_true.shape != y_score.shape or y_true.size == 0 or k <= 0:
+        raise ValueError("need same-length non-empty arrays and k > 0")
+    top = np.argsort(-y_score, kind="stable")[: min(k, y_score.size)]
+    return float(y_true[top].mean())

@@ -49,7 +49,7 @@ dashboard:        ## Streamlit alert dashboard (expects api up)
 	uv run streamlit run dashboard/app.py
 
 mlflow:           ## MLflow tracking server + registry on :5000
-	uv run mlflow server --host 127.0.0.1 --port 5000 --backend-store-uri ./mlruns
+	uv run mlflow server --host 127.0.0.1 --port 5000 --backend-store-uri sqlite:///mlflow.db --artifacts-destination ./mlruns
 
 # ── Quality ──────────────────────────────────────────────────────────────────
 test:

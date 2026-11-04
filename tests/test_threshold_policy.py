@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from streamguard.eval.metrics import psi, threshold_at_fpr
+from streamguard.eval.metrics import precision_at_k, psi, threshold_at_fpr
 
 
 class TestThresholdAtFpr:
@@ -60,3 +60,14 @@ class TestPsi:
     def test_empty_input_rejected(self):
         with pytest.raises(ValueError):
             psi(np.array([1.0]), np.array([]))
+
+
+class TestPrecisionAtK:
+    def test_counts_top_k_only(self):
+        y_true = np.array([1, 0, 1, 0, 0])
+        y_score = np.array([0.9, 0.8, 0.7, 0.1, 0.2])
+        assert precision_at_k(y_true, y_score, k=2) == pytest.approx(0.5)
+        assert precision_at_k(y_true, y_score, k=3) == pytest.approx(2 / 3)
+
+    def test_k_larger_than_sample(self):
+        assert precision_at_k(np.array([1, 0]), np.array([0.6, 0.4]), k=50) == pytest.approx(0.5)

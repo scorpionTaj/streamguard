@@ -41,11 +41,11 @@
 
 ## KPIs (targets)
 
-- **AUPRC ≥ 0.80** on the labeled test split (imbalanced data → PR-AUC, not accuracy)
+- **AUPRC ≥ 0.55** (stretch 0.60) on the temporal test split (imbalanced data → PR-AUC, not accuracy) — anchored on the measured IEEE-CIS ceiling (0.562 with all raw columns), see [PLAN.md §8](./PLAN.md#8-evaluation-protocol)
 - **p95 end-to-end detection latency < 5s** at 200 tx/s
 - **Online/offline feature parity δ < 1e-6** on sampled joins
 - Measured **false-positive rate at fixed recall** (the operational trade-off interviewers ask about)
 
 ## CV bullet (target)
 
-"Built streaming fraud detection (Kafka → Spark Structured Streaming → Redis online features) scoring 200 tx/s at <5s p95; hybrid XGBoost + autoencoder with AUPRC 0.8x, live WebSocket alert dashboard with SHAP explanations and canary model rollout."
+"Built streaming fraud detection (Kafka → Spark Structured Streaming → Redis online features) scoring 200 tx/s at <5s p95; hybrid XGBoost + autoencoder with AUPRC 0.5x (vs 0.56 all-columns ceiling), live WebSocket alert dashboard with SHAP explanations and canary model rollout."

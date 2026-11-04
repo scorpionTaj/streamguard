@@ -3,7 +3,7 @@
 **Real-time fraud detection with an online feature store**
 Kafka → Spark Structured Streaming → Redis → hybrid scoring → live Streamlit alerts.
 
-> Status: 🚧 **in progress** — M0 done (infra up, 1k real tx replayed); next: M1.
+> Status: 🚧 **in progress** — M0–M1 done (baseline val AUPRC 0.550); next: M2.
 > Companion doc: [README.md](./README.md) (concept). This document is the single source of truth for scope, contracts, KPIs and milestones.
 
 ---
@@ -94,11 +94,13 @@ Defined in `src/streamguard/schemas.py` (pydantic v2, also frozen as JSON Schema
 | `card_key` | str | `sha256(card1|card2|card5|addr1)[:16]` — stable pseudo- PAN |
 | `transaction_amt` | float | |
 | `product_cd` | str | W/C/R/H/S |
+| `card1`, `card2`, `card3`, `card5`, `addr1`, `addr2` | int/float \| null | anonymized dataset IDs (not PANs) — added at M1 |
 | `card4`, `card6` | str \| null | network / type |
 | `dist1`, `dist2` | float \| null | |
 | `p_emaildomain`, `r_emaildomain` | str \| null | |
 | `m1`…`m9` | bool \| null | match flags |
 | `c1`…`c14` | float | count features |
+| `d1`…`d15` | float \| null | timedelta features (days) — added at M1 |
 | `v` | dict[str, float] | the 30 V-features frozen in `configs/features.yaml` (§6) |
 | `device_type`, `device_info` | str \| null | identity table join (may be missing) |
 | `is_fraud` | int | ground truth — replayed labeled, enables live precision measurement |
@@ -151,17 +153,19 @@ static:
   - r_emaildomain_group
   - device_type_onehot
   - hour_sin, hour_cos, dow_sin, dow_cos   # cyclical, from event_ts
-m_flags: [m1, m2, m3, m4, m5, m6, m7, m8, m9]
+m_flags: [m1, m2, m3, m5, m6, m7, m8, m9]   # m4 is categorical in the data → excluded
 c_features: [c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14]
-v_subset: []                       # FROZEN AT M1: top-30 V-features by mutual information on train only
+raw_ids: [card1, card2, card3, card5, addr1, addr2]   # added at M1, passthrough
+d_features: [d1, …, d15]                              # added at M1, passthrough
+v_subset: [V187, V258, …]          # FROZEN AT M1: top-30 V-features by mutual information on train only
 velocity:
   windows: [5m, 1h, 24h, 7d]
   metrics:
     - txn_count                    # count in window
     - amt_sum
     - amt_mean
-    - uniq_merchants               # distinct merchant hashes
-    - time_since_last_txn          # seconds, ∞→ -1 sentinel
+    - time_since_last_txn          # seconds, ∞→ -1 sentinel (window-independent, one column)
+    # uniq_merchants dropped at M1: IEEE-CIS has no merchant field
 ```
 
 ~85 features total after one-hot. Null policy: `v`/`dist`/`device` nulls → XGBoost native NaN handling; AE input uses train-median imputation + missing-mask channel.
@@ -180,7 +184,7 @@ velocity:
 ## 8. Evaluation Protocol
 
 - **Metrics** (`src/streamguard/eval/metrics.py`): AUPRC (primary), ROC-AUC (secondary), recall @ FPR 1 % / 5 %, alert precision@50, PR curve artifact logged to MLflow on every run.
-- **Benchmark anchor:** published XGBoost PR-AUC on comparable card-fraud data: **0.78–0.88** ([EAI 2024](https://publications.eai.eu/index.php/ismla/article/view/12078): 0.78→0.88 with cost-sensitive tuning; [Masethe et al. 2026](https://www.preprints.org/manuscript/202608.1727): 0.823). KPI: **≥ 0.80**, stretch 0.85.
+- **Benchmark anchor (re-anchored at M1):** the published 0.78–0.88 XGBoost PR-AUC band ([EAI 2024](https://publications.eai.eu/index.php/ismla/article/view/12078), [Masethe et al. 2026](https://www.preprints.org/manuscript/202608.1727)) comes from *other* card-fraud datasets and does not transfer to IEEE-CIS under a strict temporal split. Measured on our split, same XGBoost params: **all 431 raw columns → val AUPRC 0.562** (the practical ceiling); original 90-feature contract → 0.496; + D1–D15 and raw card/addr IDs → 0.547. KPI: **≥ 0.55**, stretch 0.60.
 - **Parity test** (`src/streamguard/eval/parity.py`): replay 1 k sampled events through the offline polars twin vs Spark/Redis online path; per-feature `max|Δ| < 1e-6`, else CI fails. This is the online/offline consistency proof.
 - **Latency bench** (`src/streamguard/eval/latency.py`): instrumented producer→alert run (`make bench`), spans per hop written to `artifacts/bench.json`, rendered into README table.
 - **Drift** (`src/streamguard/eval/drift.py`): hourly PSI per feature vs training reference (10 bins, ε-smoothed); PSI > 0.2 → Grafana panel red + MLflow tag. Training-set reference histogram stored as a model artifact.
@@ -239,7 +243,7 @@ Heavy deps are **optional extras** (`[train]`, `[stream]`) so the default `uv sy
 | # | Name | Days | Deliverable — **definition of done** |
 |---|------|------|--------------------------------------|
 | M0 | Scaffold & smoke | 1 | `make up` green; `make replay` streams 1 k tx into Redpanda; console shows messages |
-| M1 | Data & offline baseline | 3 | `make data` + `notebooks/01_eda.py` done; `v_subset` frozen into `features.yaml`; `make train` → XGBoost-only val AUPRC logged (expect ≥ 0.75 pre-tuning) |
+| M1 | Data & offline baseline | 3 | `make data` + `notebooks/01_eda.py` done; `v_subset` frozen into `features.yaml`; `make train` → XGBoost-only val AUPRC logged (≥ 0.50; originally 0.75, re-anchored — see §8) |
 | M2 | Streaming features | 4 | features job consumes raw topic, Redis hashes populate; `make parity` green (δ < 1e-6) |
 | M3 | Scorer & registry | 3 | FastAPI consumer scores end-to-end; alerts topic populated; model pulled from MLflow alias; `/metrics` scraped |
 | M4 | Dashboard | 2 | Streamlit alert feed + counters + velocity snapshot drill-down; demo-able |
@@ -255,10 +259,10 @@ Heavy deps are **optional extras** (`[train]`, `[stream]`) so the default `uv sy
 
 | KPI | Target | Measured by | Where reported |
 |---|---|---|---|
-| AUPRC (temporal test) | ≥ 0.80 (stretch 0.85) | `make train` → MLflow run | README results table |
+| AUPRC (temporal test) | ≥ 0.55 (stretch 0.60) | `make train` → MLflow run | README results table |
 | p95 end-to-end latency @ 200 tx/s | < 5 s | `make bench` → `artifacts/bench.json` | README + Grafana |
 | Online/offline feature parity | max Δ < 1e-6 | `make parity` (1 k events) | CI test |
-| Recall @ FPR 5 % | report (≥ 0.75 expected) | `make train` | README |
+| Recall @ FPR 5 % | report (≈ 0.6 at M1 baseline) | `make train` | README |
 | Alert precision@50 | report | `make train` | README |
 | Drift (PSI, any core feature) | < 0.2 steady-state | `make drift` | Grafana panel |
 | Canary agreement | score-delta p95 < 0.02 | Prometheus | Grafana panel |

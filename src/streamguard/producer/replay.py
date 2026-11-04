@@ -35,8 +35,10 @@ DEFAULT_IDENTITY_CSV = REPO_ROOT / "data" / "train_identity.csv"
 
 _M_FLAGS = [f"M{i}" for i in range(1, 10)]
 _C_FEATURES = [f"C{i}" for i in range(1, 15)]
-_FLOAT_COLS = ["TransactionDT", "TransactionAmt", "card2", "card3", "card5", "addr1", "addr2",
-               "dist1", "dist2", *_C_FEATURES]  # fmt: skip
+_D_FEATURES = [f"D{i}" for i in range(1, 16)]
+_ID_COLS = ["card2", "card3", "card5", "addr1", "addr2"]
+_FLOAT_COLS = ["TransactionDT", "TransactionAmt", *_ID_COLS, "dist1", "dist2",
+               *_C_FEATURES, *_D_FEATURES]  # fmt: skip
 _STR_COLS = ["ProductCD", "card4", "card6", "P_emaildomain", "R_emaildomain", *_M_FLAGS]
 
 
@@ -90,6 +92,8 @@ def row_to_transaction(row: dict, v_subset: list[str]) -> Transaction:
         card_key=derive_card_key(row["card1"], row["card2"], row["card5"], row["addr1"]),
         transaction_amt=float(row["TransactionAmt"]),
         product_cd=row["ProductCD"],
+        card1=row.get("card1"),
+        **{c: _num(row.get(c)) for c in _ID_COLS},
         card4=row.get("card4"),
         card6=row.get("card6"),
         dist1=_num(row.get("dist1")),
@@ -98,6 +102,7 @@ def row_to_transaction(row: dict, v_subset: list[str]) -> Transaction:
         r_emaildomain=row.get("R_emaildomain"),
         **{m.lower(): _flag(row.get(m)) for m in _M_FLAGS},
         **{c.lower(): _num(row.get(c)) or 0.0 for c in _C_FEATURES},
+        **{d.lower(): _num(row.get(d)) for d in _D_FEATURES},
         v=v,
         device_type=row.get("DeviceType"),
         device_info=row.get("DeviceInfo"),

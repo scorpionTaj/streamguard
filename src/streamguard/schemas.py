@@ -42,6 +42,13 @@ class Transaction(BaseModel):
     card_key: str = Field(min_length=16, max_length=16, pattern=r"^[0-9a-f]{16}$")
     transaction_amt: float = Field(ge=0)
     product_cd: str = Field(pattern=r"^[WCRHS]$")
+    # Anonymized IEEE-CIS card/address IDs (not PANs) — strong model features (M1 ablation).
+    card1: int | None = None
+    card2: float | None = None
+    card3: float | None = None
+    card5: float | None = None
+    addr1: float | None = None
+    addr2: float | None = None
     card4: str | None = None  # network: visa/mastercard/…
     card6: str | None = None  # type: credit/debit/…
     dist1: float | None = None
@@ -71,6 +78,21 @@ class Transaction(BaseModel):
     c12: float = 0.0
     c13: float = 0.0
     c14: float = 0.0
+    d1: float | None = None  # D1–D15: timedeltas (days) since prior card events, as provided
+    d2: float | None = None
+    d3: float | None = None
+    d4: float | None = None
+    d5: float | None = None
+    d6: float | None = None
+    d7: float | None = None
+    d8: float | None = None
+    d9: float | None = None
+    d10: float | None = None
+    d11: float | None = None
+    d12: float | None = None
+    d13: float | None = None
+    d14: float | None = None
+    d15: float | None = None
     v: dict[str, float] = Field(default_factory=dict)  # only the frozen v_subset (§6)
     device_type: str | None = None
     device_info: str | None = None
@@ -90,5 +112,6 @@ class Alert(ScoredTx):
 
     risk_band: RiskBand
     threshold: float
-    velocity_snapshot: dict[str, float] = Field(default_factory=dict)  # Redis features at scoring time
+    # Redis features at scoring time
+    velocity_snapshot: dict[str, float] = Field(default_factory=dict)
     top_drivers: list[TopDriver] = Field(default_factory=list)  # filled async (SHAP, M5)
