@@ -8,7 +8,7 @@ carries its run's validation thresholds, so a model and its operating point
 always travel together.
 
 CLI: python -m streamguard.models.registry {promote [--force] | rollback | set-alias <alias> <v>}
-(`make promote` / `make rollback`; restart `make api` to serve the new champion.)
+(`make promote` / `make rollback`; a running scorer picks the change up within ~30 s.)
 """
 
 from __future__ import annotations
@@ -86,6 +86,12 @@ def load_alias(alias: str = CHAMPION) -> ServingModel:
     metrics = client.get_run(version.run_id).data.metrics
     return ServingModel(hybrid, str(version.version), list(hybrid.feature_names),
                         Thresholds.from_run_metrics(metrics), version.run_id)  # fmt: skip
+
+
+def alias_versions() -> tuple[str | None, str | None]:
+    """(champion, challenger) versions currently set in the registry — cheap to poll."""
+    client = _client()
+    return _alias_version(client, CHAMPION), _alias_version(client, CHALLENGER)
 
 
 def load_optional(alias: str) -> ServingModel | None:

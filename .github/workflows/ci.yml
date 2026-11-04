@@ -1,0 +1,23 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      UV_PYTHON: "3.12" # lowest supported version (local dev runs 3.13)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      # train + dev extras: models and test tooling; no pyspark (it only runs in the Spark container)
+      - run: uv sync --locked --extra train --extra dev
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      # unit tests only: no Kafka/Redis/MLflow/dataset needed
+      - run: uv run pytest

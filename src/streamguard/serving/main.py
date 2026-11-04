@@ -1,7 +1,8 @@
 """FastAPI scorer service (PLAN.md §2–3, §8) — `make api`, :8000 on the host.
 
-The lifespan loads the MLflow `champion` alias and starts the consumer loop
-(serving/consumer.py) in a background thread.
+The lifespan loads the MLflow `champion` (+ `challenger`) aliases and starts the
+consumer loop (serving/consumer.py) in a background thread; when an alias moves
+(`make promote` / `make rollback`), the scorer reloads and swaps within ~30 s.
     GET /health        liveness + model version + consumer status
     GET /alerts        alerts newer than ?since=<ISO datetime> (Streamlit polls every 2 s)
     GET /alerts/{id}   one alert incl. async SHAP top drivers
@@ -32,32 +33,35 @@ log = logging.getLogger("streamguard.api")
 state = ScorerState()
 
 
-@asynccontextmanager
-async def lifespan(_: FastAPI):
+def load_serving():
+    """Champion (+ challenger for the canary) and the champion's drift monitor."""
     from streamguard.eval.drift import DriftMonitor, load_reference, top_features
     from streamguard.models.registry import CHALLENGER, load_alias, load_optional
+    from streamguard.serving.consumer import Serving
+
+    champion = load_alias()  # no champion → no scorer
+    reference = load_reference(champion.run_id)
+    if reference is None:
+        log.warning("champion v%s has no drift reference — PSI monitoring off", champion.version)
+    drift = DriftMonitor(reference, top_features(champion.model.booster)) if reference else None
+    return Serving(champion, load_optional(CHALLENGER), drift)
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    from streamguard.models.registry import alias_versions
 
     load_dotenv()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
-    model = load_alias()  # fail fast: no champion → no scorer
-    challenger = load_optional(CHALLENGER)
-    reference = load_reference(model.run_id)
-    drift = None
-    if reference is not None:
-        drift = DriftMonitor(reference, top_features(model.model.booster))
-    else:
-        log.warning("champion v%s has no drift reference — PSI monitoring off", model.version)
     scorer = Scorer(
-        model, load_feature_spec(), load_pipeline_config(), state,
+        load_serving(), load_feature_spec(), load_pipeline_config(), state,
         os.getenv("KAFKA_BOOTSTRAP", "localhost:9092"),
         os.getenv("REDIS_URL", "redis://localhost:6379/0"),
-        challenger=challenger, drift=drift,
+        load_serving=load_serving, alias_versions=alias_versions,  # live promotion/rollback
     )  # fmt: skip
     stop = threading.Event()
     thread = threading.Thread(target=scorer.run, args=(stop,), name="scorer", daemon=True)
     thread.start()
-    log.info("scoring with champion v%s%s", model.version,
-             f", canary vs challenger v{challenger.version}" if challenger else "")  # fmt: skip
     yield
     stop.set()
     thread.join(timeout=15)
@@ -117,11 +121,12 @@ def canary() -> dict:
 
 
 @app.get("/drift")
-def drift() -> dict:
-    """Latest PSI per feature vs the champion's training reference (eval/drift.py)."""
+def drift(refresh: bool = False) -> dict:
+    """PSI per feature vs the champion's training reference (eval/drift.py): the latest
+    background result, or recomputed now with ?refresh=true."""
     if state.drift is None:
         return {"rows": 0, "features": {}, "detail": "no drift reference for this champion"}
-    return state.drift.compute()
+    return state.drift.report(refresh)
 
 
 @app.get("/latency")

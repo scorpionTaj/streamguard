@@ -67,4 +67,14 @@ ignore = ["E501"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["dashboard"]  # dashboard/views.py is plain data shaping, tested like src
 addopts = "-q"
+
+# Linux (CI) gets CPU-only torch: the PyPI wheel drags ~2.5 GB of CUDA libraries.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]

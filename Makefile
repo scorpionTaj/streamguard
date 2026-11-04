@@ -48,10 +48,10 @@ bench:            ## end-to-end latency benchmark → artifacts/bench.json
 drift:            ## PSI drift report vs training reference
 	uv run python -m streamguard.eval.drift
 
-promote:          ## challenger → champion if the live canary is within tolerance (then restart `make api`)
+promote:          ## challenger → champion if the live canary is within tolerance (scorer swaps within ~30 s)
 	uv run python -m streamguard.models.registry promote
 
-rollback:         ## champion → the version it replaced (then restart `make api`)
+rollback:         ## champion → the version it replaced (scorer swaps within ~30 s)
 	uv run python -m streamguard.models.registry rollback
 
 # ── Services (host) ──────────────────────────────────────────────────────────

@@ -142,6 +142,15 @@ class DriftMonitor:
         with self.lock:
             self.rows.extend(np.asarray(matrix, dtype=np.float32))
 
+    def report(self, refresh: bool = False) -> dict:
+        """Latest result (refreshed every 30 s by the scorer) with the current fill level;
+        `refresh=True` recomputes now (≈ 0.5 s for 111 features × 2 statistics)."""
+        if refresh:
+            return self.compute()
+        with self.lock:
+            rows = len(self.rows)
+        return self.latest | {"rows": rows}
+
     def compute(self) -> dict:
         with self.lock:
             live = np.array(self.rows)
@@ -187,7 +196,7 @@ def main() -> None:
     parser.add_argument("--top", type=int, default=25)
     args = parser.parse_args()
 
-    report = httpx.get(f"{args.api}/drift", timeout=30).json()
+    report = httpx.get(f"{args.api}/drift", params={"refresh": "true"}, timeout=30).json()
     if not report.get("features"):
         raise SystemExit(f"no drift data yet: {report.get('rows', 0):,} / "
                          f"{report.get('window', WINDOW):,} live rows (needs a full window)")  # fmt: skip

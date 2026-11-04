@@ -23,6 +23,7 @@ import threading
 import time
 from collections import Counter as TallyCounter
 from collections import deque
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -59,6 +60,8 @@ CONSUMER_LAG = Gauge(
 
 LAG_EVERY_S = 5.0
 DRIFT_EVERY_S = 30.0
+ALIAS_CHECK_S = 30.0
+MODEL_SWAPS = Counter("streamguard_model_swaps_total", "Live champion/challenger reloads")
 
 
 def risk_band(score: float, thresholds: Thresholds) -> RiskBand | None:
@@ -89,6 +92,19 @@ class ScorerState:
     # features_ready, scored, published) — epoch seconds
     spans: deque = field(default_factory=lambda: deque(maxlen=100_000))
     lock: threading.Lock = field(default_factory=threading.Lock)
+
+
+@dataclass(frozen=True)
+class Serving:
+    """Everything that changes when registry aliases move (hot-swapped as one unit)."""
+
+    champion: ServingModel
+    challenger: ServingModel | None = None
+    drift: DriftMonitor | None = None
+
+    @property
+    def versions(self) -> tuple[str, str | None]:
+        return self.champion.version, self.challenger.version if self.challenger else None
 
 
 def fetch_snapshots(redis_client, prefix: str, ids: list[int], names: list[str],
@@ -128,14 +144,17 @@ def score_events(txs: list[Transaction], snapshots: dict[int, dict[str, float]],
 
 
 class Scorer:
-    def __init__(self, model: ServingModel, spec: dict, pipeline: dict, state: ScorerState,
+    def __init__(self, serving: Serving, spec: dict, pipeline: dict, state: ScorerState,
                  bootstrap: str, redis_url: str, wait_s: float = 10.0,
-                 challenger: ServingModel | None = None,
-                 drift: DriftMonitor | None = None) -> None:  # fmt: skip
+                 load_serving: Callable[[], Serving] | None = None,
+                 alias_versions: Callable[[], tuple[str | None, str | None]] | None = None,
+                 ) -> None:  # fmt: skip
         import redis
         from confluent_kafka import Consumer, Producer
 
-        self.model, self.spec, self.pipeline, self.state = model, spec, pipeline, state
+        self.spec, self.pipeline, self.state = spec, pipeline, state
+        self.load_serving, self.alias_versions = load_serving, alias_versions
+        self._staged: Serving | None = None  # loaded by the watcher, installed between batches
         self.wait_s = wait_s
         self.velocity_names = velocity_columns(spec)
         self.redis = redis.Redis.from_url(redis_url)
@@ -148,24 +167,49 @@ class Scorer:
         self.producer = Producer({"bootstrap.servers": bootstrap, "linger.ms": 5})
         self.explainer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="shap")
         self.consumer.subscribe([pipeline["topics"]["raw"]])
-        state.model_version = model.version
-        if challenger is not None and challenger.feature_names != model.feature_names:
+        self._next_lag = 0.0
+        self.install(serving)
+
+    def install(self, serving: Serving) -> None:
+        """Make `serving` live (consumer thread, between batches); resets the canary window."""
+        challenger = serving.challenger
+        if challenger is not None and challenger.feature_names != serving.champion.feature_names:
             log.warning("challenger v%s has a different feature set — canary disabled",
                         challenger.version)  # fmt: skip
             challenger = None
-        self.challenger = challenger
-        state.challenger_version = challenger.version if challenger else None
-        state.canary = CanaryWindow() if challenger else None
-        state.drift = drift
-        self._next_lag = 0.0
+        self.serving = Serving(serving.champion, challenger, serving.drift)
+        self.model, self.challenger = serving.champion, challenger
+        with self.state.lock:
+            self.state.model_version = serving.champion.version
+            self.state.challenger_version = challenger.version if challenger else None
+            self.state.canary = CanaryWindow() if challenger else None
+            self.state.drift = serving.drift
+        log.info("serving champion v%s%s", serving.champion.version,
+                 f", canary vs challenger v{challenger.version}" if challenger else "")  # fmt: skip
+
+    def _watch_aliases(self, stop: threading.Event) -> None:
+        """Poll the registry; when an alias moves, load the new models off the hot path."""
+        while not stop.wait(ALIAS_CHECK_S):
+            try:
+                wanted = self.alias_versions()
+                if wanted == self.serving.versions or wanted[0] is None:
+                    continue
+                log.info("aliases moved %s → %s, loading", self.serving.versions, wanted)
+                self._staged = self.load_serving()
+            except Exception:  # registry hiccup: keep serving what we have
+                log.exception("alias check / model reload failed")
 
     def run(self, stop: threading.Event) -> None:
-        if self.state.drift is not None:
-            threading.Thread(
-                target=self._drift_loop, args=(stop,), name="drift", daemon=True
-            ).start()
+        threading.Thread(target=self._drift_loop, args=(stop,), name="drift", daemon=True).start()
+        if self.load_serving is not None and self.alias_versions is not None:
+            threading.Thread(target=self._watch_aliases, args=(stop,), name="aliases",
+                             daemon=True).start()  # fmt: skip
         try:
             while not stop.is_set():
+                if (staged := self._staged) is not None:
+                    self._staged = None
+                    self.install(staged)
+                    MODEL_SWAPS.inc()
                 messages = [m for m in self.consumer.consume(500, timeout=0.5) if not m.error()]
                 if messages:
                     self.process(messages)
@@ -209,7 +253,8 @@ class Scorer:
     def _drift_loop(self, stop: threading.Event) -> None:
         while not stop.wait(DRIFT_EVERY_S):
             try:
-                self.state.drift.compute()
+                if (drift := self.state.drift) is not None:
+                    drift.compute()
             except Exception:
                 log.exception("drift computation failed")
 
@@ -271,12 +316,13 @@ class Scorer:
             self.state.by_band.update(a.risk_band for a in new_alerts)
             self.state.spans.extend(spans)
         if new_alerts:  # SHAP off the publish path (PLAN.md §3)
-            self.explainer.submit(self.explain, new_alerts, matrix[alert_rows])
+            # pass the model that scored them: a hot swap may land before the job runs
+            self.explainer.submit(self.explain, self.model, new_alerts, matrix[alert_rows])
 
-    def explain(self, alerts: list[Alert], rows: np.ndarray) -> None:
+    def explain(self, model: ServingModel, alerts: list[Alert], rows: np.ndarray) -> None:
         try:
             with EXPLAIN.time():
-                drivers = top_drivers(self.model.model.booster, rows, self.model.feature_names)
+                drivers = top_drivers(model.model.booster, rows, model.feature_names)
         except Exception:
             log.exception("SHAP explanation failed")
             return

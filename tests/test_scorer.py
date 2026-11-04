@@ -121,3 +121,54 @@ class TestFetchSnapshots:
     def test_gives_up_after_deadline(self):
         fake = _FakeRedis({})
         assert fetch_snapshots(fake, "sg:tx:", [1, 2], ["txn_count_5m"], wait_s=0.05) == ({}, {})
+
+
+class TestHotSwap:
+    """Alias watcher + install, without Kafka/Redis (bare Scorer instance)."""
+
+    @staticmethod
+    def _serving(champ: str, chall: str | None, features=("a", "b")):
+        from streamguard.serving.consumer import Serving
+
+        model = lambda v, f: ServingModel(_CaptureModel(), v, list(f), THRESHOLDS)  # noqa: E731
+        return Serving(model(champ, ("a", "b")), model(chall, features) if chall else None)
+
+    def _scorer(self, serving, versions):
+        from streamguard.serving.consumer import Scorer, ScorerState
+
+        scorer = Scorer.__new__(Scorer)
+        scorer.state, scorer._staged = ScorerState(), None
+        scorer.alias_versions = lambda: versions[0]
+        scorer.load_serving = lambda: self._serving(*versions[0])
+        scorer.install(serving)
+        return scorer
+
+    def _watch_once(self, scorer, monkeypatch):
+        import threading
+
+        import streamguard.serving.consumer as consumer
+
+        monkeypatch.setattr(consumer, "ALIAS_CHECK_S", 0.01)
+        stop = threading.Event()
+        threading.Timer(0.1, stop.set).start()
+        scorer._watch_aliases(stop)
+
+    def test_install_sets_versions_and_canary(self):
+        scorer = self._scorer(self._serving("3", "4"), [("3", "4")])
+        assert (scorer.state.model_version, scorer.state.challenger_version) == ("3", "4")
+        assert scorer.state.canary is not None
+
+    def test_mismatched_challenger_disables_canary(self):
+        scorer = self._scorer(self._serving("3", "4", features=("x",)), [("3", "4")])
+        assert scorer.challenger is None and scorer.state.canary is None
+
+    def test_watcher_stages_reload_only_when_aliases_move(self, monkeypatch):
+        versions = [("3", "4")]
+        scorer = self._scorer(self._serving("3", "4"), versions)
+        self._watch_once(scorer, monkeypatch)
+        assert scorer._staged is None  # unchanged → nothing loaded
+        versions[0] = ("4", None)  # `make promote`
+        self._watch_once(scorer, monkeypatch)
+        assert scorer._staged.versions == ("4", None)
+        scorer.install(scorer._staged)
+        assert scorer.state.model_version == "4" and scorer.state.canary is None
