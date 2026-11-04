@@ -18,7 +18,7 @@ All numbers come from the commands in the last column. The data is IEEE-CIS (590
 | Live vs offline score parity       | —                                           | **0** ✅ (5 k events)                                 | M3 check                                   |
 | Recall @ FPR 5 % · precision@50   | report                                       | 0.590 · 1.00 (test)                                        | `make train`                             |
 | Canary gate                        | promote only if p95 \|Δscore\| < 0.02       | challenger at 0.118 → **refused** ✅                 | `make promote`                           |
-| Drift monitor (calibrated PSI)     | no false alarms in-distribution; catches real shifts | **0/54** train/val/test windows flagged ✅ (fixed 0.2 rule: 18 % of train windows); injected count inflation and missing-data outage caught 8/8 | `make drift`, Grafana                    |
+| Drift monitor (calibrated PSI)     | no false alarms in-distribution; catches real shifts | **0/46** train/val windows flagged ✅ (fixed 0.2 rule: 18 % of train windows); flagged 2/8 test windows on a real V218 regime change; injected shifts caught 6–8/8 | `make drift`, Grafana                    |
 
 **About the AUPRC target.** Published XGBoost PR-AUC figures (0.78–0.88) come from other card-fraud datasets. On IEEE-CIS with a temporal split, XGBoost using **all 431 raw columns** reaches only 0.561 on validation and **0.510 on test**, because the last 17 % of the timeline is harder for any model. StreamGuard's 111 streaming-safe features reach 96 % of that test ceiling. The target was re-anchored to the measured ceiling, and every step is recorded in [PLAN.md §8](./PLAN.md#8-evaluation-protocol).
 
@@ -99,7 +99,7 @@ Checks and operations: `make parity`, `make bench`, `make drift`, `make promote`
 ## Limitations & next steps
 
 - **Drift thresholds are calibrated per feature, which costs some sensitivity.** A fixed PSI > 0.2 rule false-alarmed on 18 % of 20 k-event windows *inside* the training period, and it fired live during the demo. Several top features (V201, V257, V187, c10, …) routinely swing to PSI ≈ 0.47 from one week to the next. Each feature's threshold is now the worst PSI any training window of the live window's size shows (with 0.2 as a floor). In-distribution windows no longer flag, but a slow shift on those volatile features has to exceed their normal range before it fires.
-- **PSI can't see value shifts in mostly-missing features.** V187 is 84 % missing, so shifting its non-missing values by 1, 2 or 4 std leaves PSI at 0.068, under either rule. Missing-share changes *are* caught (missing is its own bin). Next step: a second PSI over the non-missing values alone.
+- **Two PSI blind spots were found and fixed, at a measured cost.** (1) Quantile bins collapsed for features whose present values are dominated by one value (93 % of V187 = 1.0 gave a single bin), so discrete features (≤ 50 distinct values) now get one bin per value. (2) For mostly-missing features the missing bin swamps value changes, so a second, present-values-only PSI with its own calibrated threshold runs alongside. Moving 20 % of V187's present values from 1 to 2 went from 0/8 to 8/8 test windows detected. On the un-injected temporal test split, 2/8 windows now flag on V218: its present values jump from a mean of ~1.4 to ~17 in early-to-mid June, and model AUPRC in those windows is 0.45 against 0.51–0.54 in clean windows. That looks like real drift, but windows 2 and 5 score similarly low without a flag, so the link is suggestive, not proven.
 - **The autoencoder lane adds nothing yet.** Its own val AUPRC is 0.134 (base rate 0.037), and every blend scores below XGBoost alone, so the sweep picks `w = 1.0`. It stays packaged and reported as the "unknown unknowns" lane.
 - **Tail latency:** p99 is 6.85 s, driven by the micro-batch timing. Spark's real-time trigger or a smaller trigger interval would shorten it.
 - **Serving a new champion** requires restarting `make api`, since aliases are read at startup.
@@ -108,4 +108,4 @@ Checks and operations: `make parity`, `make bench`, `make drift`, `make promote`
 
 ## Repository
 
-The spec, contracts, milestone log and KPI table are in [PLAN.md](./PLAN.md) (§14 covers the layout). Most of the logic lives in `src/streamguard/`, and `tests/` holds 78 tests covering contracts, feature semantics, micro-batch-split invariance, scoring, the canary and drift.
+The spec, contracts, milestone log and KPI table are in [PLAN.md](./PLAN.md) (§14 covers the layout). Most of the logic lives in `src/streamguard/`, and `tests/` holds 82 tests covering contracts, feature semantics, micro-batch-split invariance, scoring, the canary and drift.

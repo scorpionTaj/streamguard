@@ -13,6 +13,7 @@ from streamguard.eval.drift import (
     reference_sample,
 )
 from streamguard.eval.latency import hop_stats
+from streamguard.eval.metrics import psi_finite
 from streamguard.serving.canary import MIN_EVENTS, TOLERANCE, CanaryWindow, summarize
 
 
@@ -61,8 +62,9 @@ class TestCalibration:
 
 def _monitor(train, important, window=5_000):
     sample = reference_sample(train)
-    thresholds = calibrate_thresholds(sample, train, window=window, stride=window // 2)
-    ref = DriftReference(sample, ["a", "b", "c"], thresholds, window)
+    kw = {"window": window, "stride": window // 2}
+    ref = DriftReference(sample, ["a", "b", "c"], calibrate_thresholds(sample, train, **kw),
+                         calibrate_thresholds(sample, train, statistic=psi_finite, **kw), window)  # fmt: skip
     return DriftMonitor(ref, important)
 
 
@@ -89,6 +91,19 @@ class TestDriftMonitor:
         report = monitor.compute()
         assert report["flagged"] == ["a"] and report["drift_flag"]
         assert report["features"]["c"] / report["thresholds"]["c"] > 1.0
+
+    def test_value_shift_in_mostly_missing_feature_flags(self):
+        rng = np.random.default_rng(4)
+        train = rng.normal(size=(40_000, 3))
+        train[rng.random(40_000) < 0.85, 2] = np.nan  # like V187: 85 % missing
+        monitor = _monitor(train, ["c"])
+        live = rng.normal(size=(5_000, 3))
+        live[rng.random(5_000) < 0.85, 2] = np.nan
+        live[:, 2] += 0.7  # present values shift; missing share unchanged
+        monitor.add(live)
+        report = monitor.compute()
+        assert report["features"]["c"] < report["thresholds"]["c"]  # overall PSI misses it
+        assert report["flagged"] == ["c"]  # present-only PSI catches it
 
     def test_waits_for_a_full_window(self):
         rng = np.random.default_rng(3)

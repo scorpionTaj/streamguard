@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from streamguard.eval.metrics import precision_at_k, psi, threshold_at_fpr
+from streamguard.eval.metrics import precision_at_k, psi, psi_finite, threshold_at_fpr
 
 
 class TestThresholdAtFpr:
@@ -64,6 +64,29 @@ class TestPsi:
         assert psi(values, values) < 1e-6
         assert psi(values, mostly_missing) > 0.25
         assert np.isfinite(psi(np.full(100, np.nan), values))
+
+    def test_present_only_psi_sees_value_shift_behind_missing_bin(self):
+        rng = np.random.default_rng(0)
+        reference = np.where(rng.random(20_000) < 0.85, np.nan, rng.normal(0, 1, 20_000))
+        shifted = np.where(np.isnan(reference), np.nan, reference + 3.0)
+        assert psi(reference, shifted) < 1.0  # missing bin dominates
+        assert psi_finite(reference, shifted) > 3 * psi(reference, shifted)
+        assert psi_finite(reference, reference) < 1e-6
+
+    def test_dominant_value_shift_detected(self):
+        # 93 % of present values identical (like V187): quantile edges would collapse
+        rng = np.random.default_rng(0)
+        reference = rng.choice([1.0, 2.0, 3.0], 5_000, p=[0.93, 0.05, 0.02])
+        shifted = reference.copy()
+        shifted[rng.choice(np.flatnonzero(reference == 1.0), 1_500, replace=False)] = 2.0
+        assert psi(reference, reference) < 1e-6
+        assert psi(reference, shifted) > 0.25
+        assert psi(reference, np.full(100, 7.0)) > 1.0  # unseen value above the max
+
+    def test_present_only_psi_needs_enough_values(self):
+        sparse = np.full(1_000, np.nan)
+        sparse[:50] = 1.0
+        assert psi_finite(sparse, np.ones(1_000)) == 0.0
 
     def test_empty_input_rejected(self):
         with pytest.raises(ValueError):

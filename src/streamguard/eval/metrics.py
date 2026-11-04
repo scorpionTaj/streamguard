@@ -52,26 +52,40 @@ def threshold_at_fpr(
     return ThresholdResult(threshold=float(scores[-1]) + 1.0, recall=0.0, fpr=0.0)
 
 
+DISCRETE_MAX_VALUES = 50  # at most this many distinct reference values → one bin per value
+
+
+def _psi_edges(finite: np.ndarray, bins: int) -> np.ndarray:
+    """Bin edges from the reference's present values.
+
+    Continuous: quantile edges. Discrete (≤ DISCRETE_MAX_VALUES distinct values): one
+    bin per value plus below-min / above-max bins — quantile edges collapse when one
+    value dominates (e.g. 93 % of V187 = 1.0 gave a single bin, blind to any shift).
+    """
+    if finite.size == 0:
+        return np.array([-np.inf, np.inf])
+    values = np.unique(finite)
+    if values.size <= DISCRETE_MAX_VALUES:
+        above_max = np.nextafter(values[-1], np.inf)
+        return np.concatenate([[-np.inf], values, [above_max, np.inf]])
+    edges = np.unique(np.quantile(finite, np.linspace(0.0, 1.0, bins + 1)))
+    edges[0], edges[-1] = -np.inf, np.inf
+    return edges
+
+
 def psi(expected: np.ndarray, actual: np.ndarray, bins: int = 10, eps: float = 1e-6) -> float:
     """Population Stability Index between reference and live distributions.
 
-    Quantile-binned on the finite `expected` values; NaN (missing) is its own bin,
-    so a shift in the missing share counts as drift. PSI > 0.2 is the retrain flag
-    (PLAN.md §8).
+    Binned on the finite `expected` values (quantiles, or one bin per value for
+    discrete features); NaN (missing) is its own bin, so a shift in the missing
+    share counts as drift. Thresholds are calibrated per feature (eval/drift.py).
     """
     expected = np.asarray(expected, dtype=float).ravel()
     actual = np.asarray(actual, dtype=float).ravel()
     if expected.size == 0 or actual.size == 0:
         raise ValueError("psi requires non-empty distributions")
 
-    finite = expected[np.isfinite(expected)]
-    if finite.size:
-        edges = np.unique(np.quantile(finite, np.linspace(0.0, 1.0, bins + 1)))
-        if edges.size < 2:  # degenerate (constant) reference
-            edges = np.array([edges[0] - 0.5, edges[0] + 0.5])
-        edges[0], edges[-1] = -np.inf, np.inf
-    else:
-        edges = np.array([-np.inf, np.inf])
+    edges = _psi_edges(expected[np.isfinite(expected)], bins)
 
     def proportions(values: np.ndarray) -> np.ndarray:
         missing = np.isnan(values)
@@ -81,6 +95,22 @@ def psi(expected: np.ndarray, actual: np.ndarray, bins: int = 10, eps: float = 1
     e_prop = np.clip(proportions(expected), eps, None)
     a_prop = np.clip(proportions(actual), eps, None)
     return float(np.sum((e_prop - a_prop) * np.log(e_prop / a_prop)))
+
+
+def psi_finite(expected: np.ndarray, actual: np.ndarray, bins: int = 10, eps: float = 1e-6,
+               min_count: int = 200) -> float:  # fmt: skip
+    """PSI over the non-missing values only, renormalized among them.
+
+    Complements `psi`, whose missing bin dominates a mostly-missing feature: there,
+    any shift of the few present values barely moves the overall PSI. Returns 0.0
+    when either side has fewer than `min_count` present values (too few to judge).
+    """
+    expected = np.asarray(expected, dtype=float).ravel()
+    actual = np.asarray(actual, dtype=float).ravel()
+    expected, actual = expected[np.isfinite(expected)], actual[np.isfinite(actual)]
+    if expected.size < min_count or actual.size < min_count:
+        return 0.0
+    return psi(expected, actual, bins, eps)
 
 
 def precision_at_k(y_true: np.ndarray, y_score: np.ndarray, k: int = 50) -> float:
