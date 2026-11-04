@@ -26,24 +26,27 @@ CHAMPION, CHALLENGER = "champion", "challenger"
 
 @dataclass(frozen=True)
 class Thresholds:
-    """Risk-band floors from the version's validation run (PLAN.md §9)."""
+    """Risk-band floors from the version's validation run (PLAN.md §9).
+
+    Every band is an FPR-bounded validation operating point. The old third band
+    (review, 90th-percentile val score ≈ the FPR 7.5 % point) was dropped after
+    measurement: 8–9 % precision offline, 0 % live, 2.6 % of all traffic.
+    """
 
     high: float  # FPR ≤ 1 % operating point
-    medium: float  # FPR ≤ 5 % operating point (max-recall policy)
-    review: float  # 90th-percentile validation score
+    medium: float  # FPR ≤ 5 % operating point (max-recall policy = alert gate)
 
     @classmethod
     def from_run_metrics(cls, metrics: dict[str, float]) -> Thresholds:
         return cls(
             high=metrics["val_threshold_at_fpr_1pct"],
             medium=metrics["val_threshold_at_fpr_5pct"],
-            review=metrics["val_score_p90"],
         )
 
 
 @dataclass(frozen=True)
 class ServingModel:
-    model: object  # models.ensemble.HybridModel (anything with .score(matrix) / .booster)
+    model: object  # models.ensemble.XgbModel (anything with .score(matrix) / .booster)
     version: str
     feature_names: list[str]
     thresholds: Thresholds

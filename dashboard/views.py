@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import pandas as pd
 
-BANDS = ["high", "medium", "review"]
-BAND_ICON = {"high": "🔴", "medium": "🟠", "review": "🟡"}
+BANDS = ["high", "medium"]
+BAND_ICON = {"high": "🔴", "medium": "🟠"}
+BAND_HEX = {"high": "#ff5c5c", "medium": "#ffb020"}  # matches .streamlit/config.toml
+OK_HEX, BAD_HEX, NEUTRAL_HEX = "#3ddc97", "#ff5c5c", "#5c9dff"
 WINDOWS = ["5m", "1h", "24h", "7d"]
 LABELS = ["all", "fraud", "legit"]
 
@@ -61,6 +63,11 @@ def velocity_table(snapshot: dict[str, float]) -> pd.DataFrame:
     )
 
 
+def drivers_frame(drivers: list[dict]) -> pd.DataFrame:
+    """SHAP top-drivers → signed series (feature → log-odds impact) for a diverging bar chart."""
+    return pd.Series({d["feature"]: d["impact"] for d in drivers}, dtype=float, name="impact")
+
+
 def drift_table(report: dict, top: int = 12) -> pd.DataFrame:
     """Features with the highest drift ratio (max of PSI / threshold over both statistics)."""
     ratio = report.get("ratio") or {}
@@ -77,16 +84,24 @@ def drift_table(report: dict, top: int = 12) -> pd.DataFrame:
     })  # fmt: skip
 
 
-def canary_verdict(canary: dict, tolerance: float = 0.02, min_events: int = 1000) -> str:
-    """One line for the model-health view (mirrors the promotion gate in serving/canary.py)."""
+def canary_verdict(canary: dict, tolerance: float = 0.02, min_events: int = 1000) -> dict:
+    """Model-health canary banner state (mirrors the promotion gate in serving/canary.py)."""
     if not canary.get("challenger_version"):
-        return "No challenger registered — `make train` creates one."
+        return {"state": "none",
+                "detail": "No challenger registered — `make train` creates one."}  # fmt: skip
+    if canary.get("challenger_version") == canary.get("champion_version"):
+        return {"state": "same",
+                "detail": "Challenger is the current champion — `make train` registers a fresh "
+                          "challenger."}  # fmt: skip
     events = canary.get("events", 0)
     if events < min_events:
-        return f"Collecting: {events:,} / {min_events:,} events compared."
+        return {"state": "collecting",
+                "detail": f"Collecting: {events:,} / {min_events:,} events compared."}  # fmt: skip
     p95 = canary["p95_abs_delta"]
     if canary.get("within_tolerance"):
-        return (
-            f"✅ Within tolerance (p95 |Δ| {p95:.3f} < {tolerance}) — `make promote` would succeed."
-        )
-    return f"⛔ Outside tolerance (p95 |Δ| {p95:.3f} ≥ {tolerance}) — promotion is blocked."
+        return {
+            "state": "pass",
+            "detail": f"p95 |Δ| {p95:.3f} < {tolerance} — `make promote` would succeed.",
+        }
+    return {"state": "fail",
+            "detail": f"p95 |Δ| {p95:.3f} ≥ {tolerance} — promotion is blocked."}  # fmt: skip

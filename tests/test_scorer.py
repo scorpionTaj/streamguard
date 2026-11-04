@@ -15,20 +15,27 @@ from streamguard.serving.consumer import fetch_snapshots, risk_band, score_event
 from streamguard.streaming.features_job import velocity_columns
 
 SPEC = load_feature_spec()
-THRESHOLDS = Thresholds(high=0.8, medium=0.5, review=0.4)
+THRESHOLDS = Thresholds(high=0.8, medium=0.5)
 
 
 class TestRiskBand:
     @pytest.mark.parametrize(
         ("score", "band"),
-        [(0.95, "high"), (0.8, "high"), (0.6, "medium"), (0.45, "review"), (0.1, None)],
+        [
+            (0.95, "high"),
+            (0.8, "high"),
+            (0.6, "medium"),
+            (0.5, "medium"),
+            (0.45, None),
+            (0.1, None),
+        ],
     )
     def test_bands(self, score, band):
         assert risk_band(score, THRESHOLDS) == band
 
 
 class _CaptureModel:
-    """Stands in for HybridModel: records the matrix, scores by row index."""
+    """Stands in for XgbModel: records the matrix, scores by row index."""
 
     def score(self, matrix):
         self.matrix = matrix

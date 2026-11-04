@@ -14,7 +14,7 @@ kafka:
     batch_size: 32768
 
 features_job:
-  trigger: 1 second
+  trigger: 500 milliseconds  # micro-batch formation is most of the Spark hop (make bench)
   max_offsets_per_trigger: 400
   watermark: 10 minutes
   checkpoint_dir: checkpoints/features
@@ -28,5 +28,4 @@ redis:
 alerts:
   risk_bands:
     high: thr_high      # FPR ≤ 1% operating point (M5)
-    medium: thr_medium  # FPR ≤ 5% operating point
-    review: thr_review  # 90th percentile of val scores
+    medium: thr_medium  # FPR ≤ 5% operating point (= alert gate)

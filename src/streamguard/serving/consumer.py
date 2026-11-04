@@ -6,7 +6,7 @@ One background thread, consumer group `scorer` on `transactions.raw`:
            (written by the Spark job) — exact training-time features; on
            timeout the velocity columns are NaN and a miss is counted
         2. static features from the event via the offline twin (same code as training)
-        3. champion hybrid score (XGBoost + autoencoder, batched)
+        3. champion score (XGBoost, batched)
         4. publish ScoredTx → transactions.scored; band-passing → Alert → transactions.alerts
            (with a challenger alias: score twice, record the canary delta — PLAN.md §10)
         5. SHAP top-5 for the batch's alerts on a background worker (never blocks publish);
@@ -41,6 +41,8 @@ from streamguard.streaming.features_job import velocity_columns
 
 log = logging.getLogger("streamguard.scorer")
 
+CONSUME_MAX = 100  # small polls keep `consumed` near arrival: a large cap swallows the
+#                    stream while a batch waits for Spark snapshots — the latency tail
 SCORED = Counter("streamguard_scored_total", "Transactions scored")
 ALERTS = Counter("streamguard_alerts_total", "Alerts published", ["band"])
 FEATURE_MISSES = Counter(
@@ -70,8 +72,6 @@ def risk_band(score: float, thresholds: Thresholds) -> RiskBand | None:
         return "high"
     if score >= thresholds.medium:
         return "medium"
-    if score >= thresholds.review:
-        return "review"
     return None
 
 
@@ -200,19 +200,36 @@ class Scorer:
                 log.exception("alias check / model reload failed")
 
     def run(self, stop: threading.Event) -> None:
+        import redis.exceptions
+
         threading.Thread(target=self._drift_loop, args=(stop,), name="drift", daemon=True).start()
         if self.load_serving is not None and self.alias_versions is not None:
             threading.Thread(target=self._watch_aliases, args=(stop,), name="aliases",
                              daemon=True).start()  # fmt: skip
+        redis_fails = 0
         try:
             while not stop.is_set():
                 if (staged := self._staged) is not None:
                     self._staged = None
                     self.install(staged)
                     MODEL_SWAPS.inc()
-                messages = [m for m in self.consumer.consume(500, timeout=0.5) if not m.error()]
+                messages = [m for m in self.consumer.consume(CONSUME_MAX, timeout=0.5)
+                            if not m.error()]  # fmt: skip
                 if messages:
-                    self.process(messages)
+                    try:
+                        self.process(messages)
+                    except redis.exceptions.ConnectionError:
+                        # a Redis restart must not kill the loop: the batch was neither
+                        # published nor committed (snapshots are fetched before any
+                        # publish), so back off and re-poll it
+                        redis_fails += 1
+                        delay = min(2**redis_fails, 30)
+                        log.warning("redis unavailable (fail %d) — retrying batch in %d s",
+                                    redis_fails, delay)  # fmt: skip
+                        time.sleep(delay)
+                        continue
+                    redis_fails = 0
+                    self.state.error = None
                 self.producer.poll(0)
                 if time.monotonic() >= self._next_lag:
                     self._update_lag()
@@ -283,7 +300,7 @@ class Scorer:
 
         topics, version = self.pipeline["topics"], self.model.version
         thresholds = self.model.thresholds
-        floors = {"high": thresholds.high, "medium": thresholds.medium, "review": thresholds.review}
+        floors = {"high": thresholds.high, "medium": thresholds.medium}
         new_alerts, alert_rows, spans, misses = [], [], [], 0
         for row, (msg, tx, score) in enumerate(zip(messages, txs, scores, strict=True)):
             scored = ScoredTx(**tx.model_dump(), score=float(score), model_version=version,

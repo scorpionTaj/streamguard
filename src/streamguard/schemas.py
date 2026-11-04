@@ -14,7 +14,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-RiskBand = Literal["high", "medium", "review"]
+RiskBand = Literal["high", "medium"]
 
 
 def derive_card_key(card1: int | str, card2: int | str, card5: int | str, addr1: int | str) -> str:

@@ -7,6 +7,7 @@ import pytest
 from views import (
     canary_verdict,
     drift_table,
+    drivers_frame,
     filter_alerts,
     precision_by_band,
     velocity_table,
@@ -21,7 +22,7 @@ def _alert(tx, band, score, fraud, card="aaaa1111bbbb2222", ts="2026-01-01T00:00
 ALERTS = [
     _alert(1, "high", 0.95, 1, ts="2026-01-01T00:00:01Z"),
     _alert(2, "medium", 0.60, 0, card="ffff0000eeee9999", ts="2026-01-01T00:00:02Z"),
-    _alert(3, "review", 0.45, 0, ts="2026-01-01T00:00:03Z"),
+    _alert(3, "medium", 0.45, 0, ts="2026-01-01T00:00:03Z"),
     _alert(4, "high", 0.85, 0, ts="2026-01-01T00:00:04Z"),
 ]
 
@@ -32,13 +33,13 @@ class TestFilters:
         assert [a["transaction_id"] for a in rows] == [4, 1]
 
     def test_label_score_and_card_query(self):
-        assert [a["transaction_id"] for a in filter_alerts(ALERTS, ["high", "medium", "review"],
+        assert [a["transaction_id"] for a in filter_alerts(ALERTS, ["high", "medium"],
                                                            label="fraud")] == [1]  # fmt: skip
-        assert len(filter_alerts(ALERTS, ["high", "medium", "review"], min_score=0.5)) == 3
+        assert len(filter_alerts(ALERTS, ["high", "medium"], min_score=0.5)) == 3
         assert [a["transaction_id"] for a in filter_alerts(
-            ALERTS, ["high", "medium", "review"], card_query="FFFF00")] == [2]  # fmt: skip
+            ALERTS, ["high", "medium"], card_query="FFFF00")] == [2]  # fmt: skip
         assert [a["transaction_id"] for a in filter_alerts(
-            ALERTS, ["high", "medium", "review"], card_query="3")] == [3]  # fmt: skip
+            ALERTS, ["high", "medium"], card_query="3")] == [3]  # fmt: skip
 
 
 def test_precision_by_band():
@@ -62,11 +63,19 @@ def test_drift_table_sorted_by_ratio_and_marks_top20():
     assert drift_table({}).empty
 
 
+def test_drivers_frame_is_signed_series_for_diverging_chart():
+    drivers = [{"feature": "V201", "impact": 0.42}, {"feature": "amt_sum_1h", "impact": -0.13}]
+    frame = drivers_frame(drivers)
+    assert frame["V201"] == 0.42 and frame["amt_sum_1h"] == -0.13
+    assert drivers_frame([]).empty
+
+
 @pytest.mark.parametrize(
-    ("canary", "expected"),
+    ("canary", "state", "detail_bit"),
     [
-        ({"challenger_version": None}, "No challenger"),
-        ({"challenger_version": "4", "events": 10}, "Collecting"),
+        ({"challenger_version": None}, "none", "No challenger"),
+        ({"champion_version": "5", "challenger_version": "5"}, "same", "current champion"),
+        ({"challenger_version": "4", "events": 10}, "collecting", "Collecting"),
         (
             {
                 "challenger_version": "4",
@@ -74,6 +83,7 @@ def test_drift_table_sorted_by_ratio_and_marks_top20():
                 "p95_abs_delta": 0.118,
                 "within_tolerance": False,
             },
+            "fail",
             "blocked",
         ),  # fmt: skip
         (
@@ -83,9 +93,11 @@ def test_drift_table_sorted_by_ratio_and_marks_top20():
                 "p95_abs_delta": 0.01,
                 "within_tolerance": True,
             },
+            "pass",
             "would succeed",
         ),  # fmt: skip
     ],
 )
-def test_canary_verdict(canary, expected):
-    assert expected in canary_verdict(canary)
+def test_canary_verdict(canary, state, detail_bit):
+    verdict = canary_verdict(canary)
+    assert verdict["state"] == state and detail_bit in verdict["detail"]

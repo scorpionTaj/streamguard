@@ -182,19 +182,29 @@ def main() -> None:
         rows = batch_df.toPandas()
         if rows.empty:
             return
-        client = redis.Redis.from_url(redis_url)
-        written_at = repr(time.time())  # latency span for `make bench`
-        with client.pipeline(transaction=False) as pipe:
-            for _, row in rows.iterrows():
-                key = f"{redis_cfg['tx_key_prefix']}{int(row['transaction_id'])}"
-                mapping = redis_mapping(row, feature_names) | {"written_at": written_at}
-                pipe.hset(key, mapping=mapping)
-                pipe.expire(key, int(redis_cfg["tx_ttl_seconds"]))
-            for _, row in latest_per_card(rows).iterrows():
-                key = redis_card_key(redis_cfg["key_prefix"], row["card_key"])
-                pipe.hset(key, mapping=redis_mapping(row, feature_names))
-                pipe.expire(key, ttl_seconds)
-            pipe.execute()
+        # bounded retry: a Redis restart must stall the batch, not kill the stream job
+        for attempt in range(7):
+            try:
+                client = redis.Redis.from_url(redis_url)
+                written_at = repr(time.time())  # latency span for `make bench`
+                with client.pipeline(transaction=False) as pipe:
+                    for _, row in rows.iterrows():
+                        key = f"{redis_cfg['tx_key_prefix']}{int(row['transaction_id'])}"
+                        mapping = redis_mapping(row, feature_names) | {"written_at": written_at}
+                        pipe.hset(key, mapping=mapping)
+                        pipe.expire(key, int(redis_cfg["tx_ttl_seconds"]))
+                    for _, row in latest_per_card(rows).iterrows():
+                        key = redis_card_key(redis_cfg["key_prefix"], row["card_key"])
+                        pipe.hset(key, mapping=redis_mapping(row, feature_names))
+                        pipe.expire(key, ttl_seconds)
+                    pipe.execute()
+                break
+            except redis.exceptions.RedisError:
+                if attempt == 6:
+                    raise  # ~63 s of outage: a real incident, let the query fail loudly
+                delay = 2**attempt
+                print(f"batch {batch_id}: redis unavailable, retrying in {delay} s", flush=True)
+                time.sleep(delay)
         print(f"batch {batch_id}: {len(rows)} events → {rows['card_key'].nunique()} cards")
 
     query = (

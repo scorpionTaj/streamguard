@@ -67,7 +67,7 @@ services:
     command:
       - /opt/spark/bin/spark-submit
       - --master
-      - local[2]
+      - local[4]
       - --packages
       - org.apache.spark:spark-sql-kafka-0-10_2.13:4.0.0
       - --conf

@@ -1,9 +1,8 @@
 """Per-alert explanations (PLAN.md §9): top-5 signed SHAP contributions.
 
 Uses XGBoost's native TreeSHAP (`pred_contribs=True`, the algorithm behind
-shap.TreeExplainer) on the XGBoost lane, in log-odds units. The autoencoder lane
-is reported as its own percentile, not decomposed. Runs ASYNC in the scorer —
-never on the alert publish path.
+shap.TreeExplainer) on the served model, in log-odds units. Runs ASYNC in the
+scorer — never on the alert publish path.
 """
 
 from __future__ import annotations
