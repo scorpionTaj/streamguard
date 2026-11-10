@@ -11,9 +11,13 @@ One background thread, consumer group `scorer` on `transactions.raw`:
            (with a challenger alias: score twice, record the canary delta — PLAN.md §10)
         5. SHAP top-5 for the batch's alerts on a background worker (never blocks publish);
            drivers land on the API's alert records (GET /alerts/{transaction_id})
-Offsets are stored only after publishing (at-least-once). Prometheus metrics are
-module-level and exported by main.py /metrics; a side thread recomputes feature
-PSI (eval/drift.py) and the loop refreshes consumer lag every few seconds.
+Each batch is one Kafka transaction: its scored messages, its alerts and the consumer
+offsets commit together or not at all (exactly-once on the output topics for
+read-committed readers, the client default). A scorer killed mid-batch leaves an open
+transaction that the next start aborts, then resumes from the last committed batch: no
+event is lost and none is published twice. Prometheus metrics are module-level and
+exported by main.py /metrics; a side thread recomputes feature PSI (eval/drift.py) and
+the loop refreshes consumer lag every few seconds.
 """
 
 from __future__ import annotations
@@ -62,6 +66,7 @@ CONSUMER_LAG = Gauge(
     "streamguard_consumer_lag_messages", "transactions.raw messages not yet scored"
 )
 
+TRANSACTIONAL_ID = "streamguard-scorer"  # one scorer; a restart fences its predecessor
 LAG_EVERY_S = 5.0
 DRIFT_EVERY_S = 30.0
 ALIAS_CHECK_S = 30.0
@@ -107,6 +112,21 @@ class Serving:
     @property
     def versions(self) -> tuple[str, str | None]:
         return self.champion.version, self.challenger.version if self.challenger else None
+
+
+def batch_bounds(messages: list) -> tuple[dict[tuple[str, int], int], dict[tuple[str, int], int]]:
+    """Per (topic, partition): the batch's first offset, and the offset after its last.
+
+    The second is what the group resumes from once the batch is published; the first is
+    where to rewind when it has to be polled again.
+    """
+    first: dict[tuple[str, int], int] = {}
+    resume: dict[tuple[str, int], int] = {}
+    for m in messages:
+        key = (m.topic(), m.partition())
+        first[key] = min(first.get(key, m.offset()), m.offset())
+        resume[key] = max(resume.get(key, 0), m.offset() + 1)
+    return first, resume
 
 
 def fetch_snapshots(redis_client, prefix: str, ids: list[int], names: list[str],
@@ -164,9 +184,11 @@ class Scorer:
             "bootstrap.servers": bootstrap,
             "group.id": "scorer",
             "auto.offset.reset": "earliest",
-            "enable.auto.offset.store": False,
+            "enable.auto.commit": False,  # offsets move only inside the publish transaction
         })  # fmt: skip
-        self.producer = Producer({"bootstrap.servers": bootstrap, "linger.ms": 5})
+        self.producer = Producer({"bootstrap.servers": bootstrap, "linger.ms": 5,
+                                  "transactional.id": TRANSACTIONAL_ID})  # fmt: skip
+        self.producer.init_transactions(30)  # also aborts a killed predecessor's open batch
         self.explainer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="shap")
         self.consumer.subscribe([pipeline["topics"]["raw"]])
         self._next_lag = 0.0
@@ -223,12 +245,13 @@ class Scorer:
                     except redis.exceptions.ConnectionError:
                         # a Redis restart must not kill the loop: the batch was neither
                         # published nor committed (snapshots are fetched before any
-                        # publish), so back off and re-poll it
+                        # publish), so back off, rewind and poll it again
                         redis_fails += 1
                         delay = min(2**redis_fails, 30)
                         log.warning("redis unavailable (fail %d) — retrying batch in %d s",
                                     redis_fails, delay)  # fmt: skip
                         time.sleep(delay)
+                        self.rewind(messages)
                         continue
                     redis_fails = 0
                     self.state.error = None
@@ -243,6 +266,39 @@ class Scorer:
             self.explainer.shutdown(wait=False, cancel_futures=True)
             self.producer.flush(10)
             self.consumer.close()
+
+    def rewind(self, messages: list) -> None:
+        """Put the consumer back at the start of a batch that was not published."""
+        from confluent_kafka import TopicPartition
+
+        first, _ = batch_bounds(messages)
+        for (topic, partition), offset in first.items():
+            self.consumer.seek(TopicPartition(topic, partition, offset))
+
+    def publish(self, messages: list, outputs: list[tuple[str, str, str]]) -> None:
+        """Write `outputs` (topic, key, value) and move the group past `messages`, atomically.
+
+        If anything fails the transaction is aborted: nothing becomes visible, the offsets
+        stay where they were, and the error propagates.
+        """
+        from confluent_kafka import TopicPartition
+
+        _, resume = batch_bounds(messages)
+        self.producer.begin_transaction()
+        try:
+            for topic, key, value in outputs:
+                self.producer.produce(topic, key=key, value=value)
+            self.producer.send_offsets_to_transaction(
+                [TopicPartition(t, p, offset) for (t, p), offset in resume.items()],
+                self.consumer.consumer_group_metadata(),
+            )
+            self.producer.commit_transaction()
+        except Exception:
+            try:
+                self.producer.abort_transaction()
+            except Exception:  # e.g. fenced by a newer scorer: the original error matters
+                log.exception("could not abort the publish transaction")
+            raise
 
     def _update_lag(self) -> None:
         """Messages on transactions.raw past the scorer's position (consumer thread only)."""
@@ -303,28 +359,32 @@ class Scorer:
         topics, version = self.pipeline["topics"], self.model.version
         thresholds = self.model.thresholds
         floors = {"high": thresholds.high, "medium": thresholds.medium}
-        new_alerts, alert_rows, spans, misses = [], [], [], 0
-        for row, (msg, tx, score) in enumerate(zip(messages, txs, scores, strict=True)):
+        outputs: list[tuple[str, str, str]] = []
+        new_alerts, alert_rows, misses = [], [], 0
+        for row, (tx, score) in enumerate(zip(txs, scores, strict=True)):
             scored = ScoredTx(**tx.model_dump(), score=float(score), model_version=version,
                               scored_at=datetime.now(UTC))  # fmt: skip
-            self.producer.produce(topics["scored"], key=tx.card_key, value=scored.model_dump_json())
+            outputs.append((topics["scored"], tx.card_key, scored.model_dump_json()))
             snapshot = snapshots.get(tx.transaction_id)
             misses += snapshot is None
             if band := risk_band(scored.score, thresholds):
                 alert = Alert(**scored.model_dump(), risk_band=band, threshold=floors[band],
                               velocity_snapshot=snapshot or {})  # fmt: skip
-                self.producer.produce(topics["alerts"], key=tx.card_key,
-                                      value=alert.model_dump_json())  # fmt: skip
+                outputs.append((topics["alerts"], tx.card_key, alert.model_dump_json()))
                 new_alerts.append(alert)
                 alert_rows.append(row)
-                ALERTS.labels(band).inc()
-            self.consumer.store_offsets(msg)
-            published_at, created_at = time.time(), msg.timestamp()[1] / 1000.0
+        self.publish(messages, outputs)
+        published_at = time.time()  # the commit: when readers can first see the batch
+
+        spans = []
+        for msg, tx in zip(messages, txs, strict=True):
+            created_at = msg.timestamp()[1] / 1000.0
             E2E.observe(max(0.0, published_at - created_at))
             spans.append((tx.transaction_id, created_at, consumed_at,
                           written_at.get(tx.transaction_id, float("nan")),
                           features_at, scored_at, published_at))  # fmt: skip
-        self.producer.poll(0)
+        for alert in new_alerts:
+            ALERTS.labels(alert.risk_band).inc()
 
         SCORED.inc(len(txs))
         FEATURE_MISSES.inc(misses)
