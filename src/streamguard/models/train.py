@@ -9,8 +9,7 @@ Contract:
 
 Selection (early stopping, band thresholds) uses val only; the temporal test
 split is evaluated once per run and only reported. The autoencoder ensemble of
-M5 was measured and cut post-v0.1.0 (see models/ensemble.py); models/autoencoder.py
-keeps the lane's reference implementation.
+M5 was measured and cut post-v0.1.0 (see models/ensemble.py).
 """
 
 from __future__ import annotations

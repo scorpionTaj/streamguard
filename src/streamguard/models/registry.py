@@ -80,7 +80,7 @@ def assign_new_version(version: str | int) -> str:
 
 
 def load_alias(alias: str = CHAMPION) -> ServingModel:
-    """Load the aliased hybrid model (pyfunc) plus its run's thresholds."""
+    """Load the aliased model (pyfunc) plus its run's thresholds."""
     import mlflow.pyfunc
 
     client = _client()
