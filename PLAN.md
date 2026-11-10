@@ -60,7 +60,7 @@ Kafka → Spark Structured Streaming → Redis → hybrid scoring → live Strea
 | 6 | Dashboard | **Streamlit** | host | Alert feed (`st.fragment(run_every=2s)`), live counters, SHAP drill-down |
 | 7 | Model registry | **MLflow** | host (`make mlflow`) | Train/run tracking, model registry, champion/challenger aliases |
 | 8 | Observability | Prometheus + Grafana | containers | Lag, throughput, p95 latency, Redis hit-rate, drift PSI |
-| 9 | Offline features / training | polars + XGBoost + PyTorch | host | Batch twin of online features; model training/eval |
+| 9 | Offline features / training | polars + XGBoost *(+ PyTorch until the autoencoder lane was cut)* | host | Batch twin of online features; model training/eval |
 
 **Why Redpanda:** single binary, no JVM/ZooKeeper, Kafka-API compatible (swap to `apache/kafka` KRaft by editing one image line), built-in console UI for demos.
 
@@ -213,7 +213,7 @@ velocity:
 
 **M5 result (run `b94ee73d…`, registered v3 = champion):** AE alone val AUPRC 0.134 / test 0.064 (base rate ≈ 0.037), so it carries some signal but every blend is worse than XGBoost alone: sweep 0.466 (w=0.5) → 0.543 (0.8) → 0.549 (0.9) → **0.550 (w=1.0, selected)**. The AE lane stays packaged, calibrated and reported, and is skipped at serving while w=1. **Temporal test (one evaluation, never used for selection):** AUPRC **0.489**, ROC-AUC 0.884, recall@FPR 5 % 0.590, precision@50 1.0. Reference: XGBoost on all 431 raw columns gets 0.561 val / **0.510 test**, so the test period is harder for any model and ours reaches 96 % of that ceiling.
 
-*(post-v0.1.0)* **The AE lane was measured once more and cut.** The last untested hypothesis — that the AE is a *behavioral* detector and wants velocity features only — was run against the v3 champion: the velocity-only lane scored **val AUPRC 0.064** (half the all-features lane, and the loss curve converges to near-zero: it just learns to reconstruct velocities), and every blend again selected w = 1.0. With both configurations measured and no case for the lane, the model is **XGBoost-only** from v5 on: `models/ensemble.py` packages booster + feature order, the scorer no longer loads torch, and `models/autoencoder.py` stays as the reference implementation (tested). Versions ≤ 4 carry the old AE-packaged pyfunc and need pre-0.1.1 code to load; v5 reproduces v3's metrics exactly (same seed/params — val 0.5503, test 0.4892), which is the point: only the package changed.
+*(post-v0.1.0)* **The AE lane was measured once more and cut.** The last untested hypothesis — that the AE is a *behavioral* detector and wants velocity features only — was run against the v3 champion: the velocity-only lane scored **val AUPRC 0.064** (half the all-features lane, and the loss curve converges to near-zero: it just learns to reconstruct velocities), and every blend again selected w = 1.0. With both configurations measured and no case for the lane, the model is **XGBoost-only** from v5 on: `models/ensemble.py` packages booster + feature order, and the scorer no longer loads torch. `models/autoencoder.py` was kept as a tested reference at first, then removed together with the torch dependency (it is in git history before that commit). Versions ≤ 4 carry the old AE-packaged pyfunc and need pre-0.1.1 code to load; v5 reproduces v3's metrics exactly (same seed/params — val 0.5503, test 0.4892), which is the point: only the package changed.
 
 **Packaging:** one MLflow pyfunc per version — *(≤ v4: booster + AE weights + preprocessing + calibration + w + feature order; v5 on: booster + feature order)* — loaded by the scorer via the alias. macOS note: torch and XGBoost ship separate libomp runtimes; `import_torch()` loads XGBoost first (else segfault) and pins torch to one thread (else deadlock) — a serving-path concern until the AE cut removed torch from the scorer.
 
@@ -233,7 +233,7 @@ velocity:
 4. **Grafana boards (provisioned):** consume lag (s), tx/s, alert rate, p50/p95/p99 latency, Redis hit-rate, PSI heatmap, canary delta.
 
 **Resilience drills *(post-v0.1.0):*** three kill-mid-stream drills at ~200 tx/s (12 k events each, measured with `scripts/measure_resilience.py`, `make resilience-mark` / `make resilience-measure SINCE=…`):
-- **Scorer `kill -9`:** the consumer group resumes from its last commit — **12 000/12 000 scored, 0 missing, 900 duplicates** (the ≤ 5 s auto-commit window), recovery ≈ 90 s incl. model reload. At-least-once, loss-free.
+- **Scorer `kill -9`:** the consumer group resumes from its last commit — **12 000/12 000 scored, 0 missing, 900 duplicates** (the ≤ 5 s auto-commit window), recovery ≈ 90 s incl. model reload. At-least-once, loss-free. *(Later: one Kafka transaction per batch — scores, alerts and offsets together. The same drill, with one kill and with three, measured 12 000/12 000, 0 missing, **0 duplicates**; p95 latency +0.15 s.)*
 - **Redis restart:** originally crashed *both* remaining components — the Spark `foreachBatch` Redis writer (no retry) and the scorer's consumer loop (a `ConnectionError` in the snapshot fetch killed the thread). Fixed: the Spark writer retries with exponential backoff (~63 s); the scorer re-polls the batch (snapshot fetch precedes any publish, so a failed batch is neither published nor committed). After the fix both survive a mid-stream Redis restart: 0 missing, ~700 events published in degraded mode (no velocity snapshot) while Redis was down.
 - **Spark kill:** checkpoint resume replays the gap and re-writes the missing snapshots — **0 duplicates, 0 missing**, self-healed.
 - **Silent driver death (found via log sweep):** once, ~25 min into an idle stream, the driver's scheduler backend vanished with *no logged trigger* — the container stayed `Up` with a half-dead JVM (executor heartbeats failing forever, query dead). Mitigations: `restart: unless-stopped` on `spark-features` (clean-exit deaths self-heal from the checkpoint), streaming lifecycle logging at INFO (`docker/spark-log4j2.properties`) so the next occurrence leaves a trace, and the runbook signal: **consumer lag growing while `sg-spark` is Up → `docker compose rm -sf spark-features && make features`** (checkpoint-safe; during such a window the scorer keeps publishing in degraded mode — measured: 300/300 events scored, none lost, 300 feature misses).
@@ -255,7 +255,7 @@ velocity:
 | Broker | Redpanda v24 + console | containers, ~1 GB |
 | Streaming | PySpark 4.0 (`apache/spark:4.0.0` image) | container, mem-limit 2 GB; fallback `apache/spark:3.5.6` if 4.0 image issues |
 | Online store | Redis 7.4-alpine, AOF on | container, < 200 MB |
-| Offline ML | polars, XGBoost 2.x, SHAP ≥ 0.48 (numpy-2 safe), scikit-learn 1.5, PyTorch 2.x (CPU/MPS) | host |
+| Offline ML | polars, XGBoost 2.x, SHAP ≥ 0.48 (numpy-2 safe), scikit-learn 1.5 *(PyTorch 2.x was removed with the autoencoder lane)* | host |
 | Serving/UI | FastAPI, uvicorn, Streamlit ≥ 1.38 (`st.fragment`) | host |
 | Registry | MLflow 2.x | host, `make mlflow` → :5000 |
 | Observability | Prometheus v2.54, Grafana 11 | containers |
@@ -316,7 +316,7 @@ streamguard/
 │   ├── producer/replay.py    # replay clock + pacing helpers (implemented) / loop (M0)
 │   ├── streaming/features_job.py   # Spark SS job (M2)
 │   ├── offline/features.py   # polars offline twin (M1–M2)
-│   ├── models/               # train.py, autoencoder.py, explainer.py, registry.py (M1/M3/M5)
+│   ├── models/               # train.py, ensemble.py, explainer.py, registry.py (M1/M3/M5)
 │   ├── serving/              # main.py (API), consumer.py (scorer loop), canary.py (M3/M6)
 │   └── eval/                 # metrics.py (implemented), parity.py, latency.py, drift.py (M2/M6)
 ├── dashboard/app.py          # Streamlit (M4)
