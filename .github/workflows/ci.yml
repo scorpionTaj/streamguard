@@ -21,3 +21,26 @@ jobs:
       - run: uv run ruff format --check .
       # unit tests only: no Kafka/Redis/MLflow/dataset needed
       - run: uv run pytest
+
+  # The real producer, Spark job and parity check against a real broker and Redis.
+  # The Kaggle dataset cannot be fetched here, so the stream is a synthetic file with the
+  # same columns: this gates the streaming plumbing, not the model.
+  parity:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      UV_PYTHON: "3.12"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+      - run: uv run python scripts/synthetic_data.py --out data/synthetic_transaction.csv
+      - run: docker compose up -d --wait redpanda redis
+      - run: docker compose up -d --build spark-features
+      - run: uv run python -m streamguard.producer.replay --source data/synthetic_transaction.csv --speed 0
+      - run: uv run python -m streamguard.eval.parity --sample 300 --min-cards 300 --wait 300
+      - if: failure()
+        run: docker compose logs --tail=200 spark-features

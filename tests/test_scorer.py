@@ -179,3 +179,110 @@ class TestHotSwap:
         assert scorer._staged.versions == ("4", None)
         scorer.install(scorer._staged)
         assert scorer.state.model_version == "4" and scorer.state.canary is None
+
+
+class _Msg:
+    def __init__(self, partition: int, offset: int, topic: str = "transactions.raw"):
+        self._topic, self._partition, self._offset = topic, partition, offset
+
+    def topic(self):
+        return self._topic
+
+    def partition(self):
+        return self._partition
+
+    def offset(self):
+        return self._offset
+
+
+class _FakeProducer:
+    """Records the transactional call sequence; `fail_on` makes one step raise."""
+
+    def __init__(self, fail_on: str | None = None):
+        self.calls: list[tuple] = []
+        self.fail_on = fail_on
+
+    def _step(self, name: str, *detail) -> None:
+        self.calls.append((name, *detail))
+        if name == self.fail_on:
+            raise RuntimeError(f"{name} failed")
+
+    def begin_transaction(self):
+        self._step("begin")
+
+    def produce(self, topic, key, value):
+        self._step("produce", topic, key, value)
+
+    def send_offsets_to_transaction(self, offsets, group_metadata):
+        self._step("offsets", sorted((tp.partition, tp.offset) for tp in offsets), group_metadata)
+
+    def commit_transaction(self):
+        self._step("commit")
+
+    def abort_transaction(self):
+        self._step("abort")
+
+
+class _FakeConsumer:
+    def __init__(self):
+        self.seeks: list[tuple[int, int]] = []
+
+    def consumer_group_metadata(self):
+        return "group-metadata"
+
+    def seek(self, tp):
+        self.seeks.append((tp.partition, tp.offset))
+
+
+class TestExactlyOncePublish:
+    """One batch = one transaction: outputs and consumer offsets commit together."""
+
+    MESSAGES = [_Msg(0, 10), _Msg(1, 4), _Msg(0, 11), _Msg(0, 12)]
+    OUTPUTS = [("transactions.scored", "k1", "v1"), ("transactions.alerts", "k1", "a1")]
+
+    @staticmethod
+    def _scorer(producer):
+        from streamguard.serving.consumer import Scorer
+
+        scorer = Scorer.__new__(Scorer)
+        scorer.producer, scorer.consumer = producer, _FakeConsumer()
+        return scorer
+
+    def test_batch_bounds_per_partition(self):
+        from streamguard.serving.consumer import batch_bounds
+
+        first, resume = batch_bounds(self.MESSAGES)
+        assert first == {("transactions.raw", 0): 10, ("transactions.raw", 1): 4}
+        assert resume == {("transactions.raw", 0): 13, ("transactions.raw", 1): 5}
+
+    def test_outputs_and_offsets_commit_in_one_transaction(self):
+        producer = _FakeProducer()
+        self._scorer(producer).publish(self.MESSAGES, self.OUTPUTS)
+        assert producer.calls == [
+            ("begin",),
+            ("produce", "transactions.scored", "k1", "v1"),
+            ("produce", "transactions.alerts", "k1", "a1"),
+            ("offsets", [(0, 13), (1, 5)], "group-metadata"),  # the offset after each last message
+            ("commit",),
+        ]
+
+    @pytest.mark.parametrize("step", ["produce", "offsets", "commit"])
+    def test_failure_aborts_and_propagates(self, step):
+        producer = _FakeProducer(fail_on=step)
+        with pytest.raises(RuntimeError, match=f"{step} failed"):
+            self._scorer(producer).publish(self.MESSAGES, self.OUTPUTS)
+        names = [call[0] for call in producer.calls]
+        assert names[-1] == "abort" and names.count("commit") == (step == "commit")
+
+    def test_failed_abort_does_not_mask_the_cause(self):
+        class _AbortFails(_FakeProducer):
+            def abort_transaction(self):
+                raise KeyError("fenced")
+
+        with pytest.raises(RuntimeError, match="commit failed"):
+            self._scorer(_AbortFails(fail_on="commit")).publish(self.MESSAGES, self.OUTPUTS)
+
+    def test_rewind_returns_to_the_batch_start(self):
+        scorer = self._scorer(_FakeProducer())
+        scorer.rewind(self.MESSAGES)
+        assert sorted(scorer.consumer.seeks) == [(0, 10), (1, 4)]

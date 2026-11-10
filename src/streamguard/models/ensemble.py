@@ -1,9 +1,12 @@
 """Served model = XGBoost booster packaged with its feature order (PLAN.md §9).
 
-The autoencoder lane (models/autoencoder.py) was measured and cut *(post-v0.1.0)*:
-its own val AUPRC was 0.134 (0.064 on the 13 velocity features alone) and every
-blend scored below XGBoost alone, so the weight sweep always picked w = 1.0.
-autoencoder.py stays as reference code; the package and the scorer are XGBoost-only.
+The autoencoder lane was measured and cut *(post-v0.1.0)*: its own val AUPRC was
+0.134 (0.064 on the 13 velocity features alone) and every blend scored below
+XGBoost alone, so the weight sweep always picked w = 1.0. Its code and the torch
+dependency are gone; the measurements are in docs/WRITEUP.md.
+
+The module keeps its name because registered MLflow versions import `XgbModel`
+from this path.
 """
 
 from __future__ import annotations
