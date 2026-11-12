@@ -24,7 +24,7 @@ class TestDecide:
 
 def _watcher(flags: list[dict], failures: int = 0, clock: list[float] | None = None):
     """Watcher with scripted poll responses and a failing-until-N train stub."""
-    calls = {"poll": 0, "train": 0}
+    calls = {"poll": 0, "train": 0, "tag": 0}
 
     def poll():
         report = flags[min(calls["poll"], len(flags) - 1)]
@@ -36,8 +36,11 @@ def _watcher(flags: list[dict], failures: int = 0, clock: list[float] | None = N
         if calls["train"] <= failures:
             raise RuntimeError("train boom")
 
+    def tag(record):  # the MLflow registry is never reached from tests
+        calls["tag"] += 1
+
     watcher = DriftWatcher(api="fake", consecutive=3, cooldown_s=100.0, poll=poll, train=train,
-                           clock=lambda: clock[0] if clock else 0.0)  # fmt: skip
+                           tag=tag, clock=lambda: clock[0] if clock else 0.0)  # fmt: skip
     return watcher, calls
 
 
@@ -55,6 +58,7 @@ class TestPollOnce:
         assert record == {"triggered_at": record["triggered_at"], "flagged": ["c1"],
                           "rows": 20000}  # fmt: skip
         assert calls["train"] == 1 and watcher.flags == []  # flags reset after triggering
+        assert calls["tag"] == 1  # the new challenger is labelled once
 
     def test_window_not_ready_is_not_evidence(self):
         watcher, calls = _watcher(
@@ -92,7 +96,7 @@ class TestPollOnce:
                                                   "error": True}  # fmt: skip
         watcher.flags = [True, True, True]
         assert watcher.poll_once() is None  # cooldown set even though the train failed
-        assert calls["train"] == 1
+        assert calls["train"] == 1 and calls["tag"] == 0  # nothing new to label
 
     def test_stale_history_beyond_the_run_is_dropped(self):
         watcher, _ = _watcher([FLAG])
