@@ -39,18 +39,21 @@ def decide(flags: list[bool], consecutive: int) -> bool:
 
 @dataclass
 class DriftWatcher:
-    """Poll → decide → retrain-once-per-cooldown. `poll` and `train` are injectable for tests."""
+    """Poll → decide → retrain-once-per-cooldown. `poll`, `train` and `tag` are injectable for
+    tests; the defaults reach the scorer API, the training script and the MLflow registry."""
 
     api: str
     consecutive: int = 3
     cooldown_s: float = 3600.0
     poll: object = None  # () → report dict
     train: object = None  # (report) → None, raises on failure
+    tag: object = None  # (record) → None, labels the new challenger in the registry
     clock: object = time.monotonic
 
     def __post_init__(self) -> None:
         self._poll = self.poll or self._poll_http
         self._train = self.train or self._train_subprocess
+        self._tag = self.tag or self._tag_challenger
         self._clock = self.clock
         self.flags: list[bool] = []
         self.retrains: list[dict] = []
@@ -93,7 +96,7 @@ class DriftWatcher:
             log.exception("retrain failed; backing off for %.0f s", self.cooldown_s)
             return record | {"error": True}
         self.retrains.append(record)
-        self._tag_challenger(record)
+        self._tag(record)
         log.info("new challenger registered (champion untouched — canary still decides)")
         return record
 
