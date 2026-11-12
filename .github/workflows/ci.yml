@@ -20,7 +20,7 @@ jobs:
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       # unit tests only: no Kafka/Redis/MLflow/dataset needed
-      - run: uv run pytest
+      - run: uv run pytest --durations=15
 
   # The real producer, Spark job and parity check against a real broker and Redis.
   # The Kaggle dataset cannot be fetched here, so the stream is a synthetic file with the
